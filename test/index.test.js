@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { isDshResponse, parseListenerPorts } from '../src/index.js'
+import { isDshResponse, parseListenerPorts, readBodyPrefix } from '../src/index.js'
 
 test('parses Linux ss listeners', () => {
   const ports = parseListenerPorts([
@@ -18,4 +18,16 @@ test('recognizes authenticated and unauthenticated DSH pages', () => {
   assert.equal(isDshResponse(401, 'dsh web authentication required; reopen the URL printed by dsh web.'), true)
   assert.equal(isDshResponse(200, '<script>window.__DSH_BOOT__ = {}</script>'), true)
   assert.equal(isDshResponse(200, '<html>another app</html>'), false)
+})
+
+test('caps probe response bodies before buffering them', async () => {
+  const bytes = new TextEncoder().encode('x'.repeat(32 * 1024))
+  const response = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes)
+      controller.close()
+    },
+  }))
+  const body = await readBodyPrefix(response, 1024)
+  assert.equal(new TextEncoder().encode(body).byteLength, 1024)
 })

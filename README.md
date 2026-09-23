@@ -7,7 +7,7 @@
 ## 功能
 
 - 自动读取 Windows、Linux、macOS 的本机 TCP 监听端口。
-- 通过 DSH 启动页或认证响应识别 DSH 实例。
+- 通过 IPv4/IPv6 loopback 探测 DSH 启动页或认证响应，并自动排除主控自身端口。
 - 左侧栏提供紧凑的服务器 Hub 入口。
 - 顶部横向标签切换服务器，主控外壳不会整页跳转。
 - 每个服务器 iframe 保持挂载，来回切换不会主动销毁页面状态。
@@ -88,7 +88,7 @@ dsh plugin --profile web remove dsh-server-hub
 
 - 自动扫描发生在运行主控 DSH 的机器上。插件部署在 Linux 服务器时，看不到 Windows PC 上的本地隧道端口。
 - 目标 DSH 必须允许被 iframe 嵌入。如果目标响应设置了阻止嵌入的 CSP `frame-ancestors` 或 `X-Frame-Options`，需要改用主控反向代理方案。
-- 当前默认生成 `http://127.0.0.1:<port>/` 地址；HTTPS 或非 loopback 场景需要后续增加完整 URL 配置。
+- 自动探测仅访问 `127.0.0.1` 和 `::1`；只绑定其他网卡地址、HTTPS 或非 loopback 的场景需要后续增加完整 URL 配置。
 - 不要把本插件安装到远程 DSH；它只属于主控 Web profile。
 
 ## 开发
@@ -114,7 +114,7 @@ scripts/build.mjs 生成 lib/ 发布产物
 
 - 扫描 API 会经过 DSH `connection.requestRejection()` 登录校验。
 - 只探测系统已经处于监听状态的本机 TCP 端口，最多 256 个。
-- 每个 HTTP 探测有 1.2 秒超时，并限制并发数。
+- 每个 HTTP 探测有 1.2 秒超时、256 KiB 流式读取上限，并限制并发数。
 - 不向远程服务器写入任何文件，也不要求远程服务器加载插件。
 
 ## License
