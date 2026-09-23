@@ -1,6 +1,6 @@
 {
   "name": "dsh-server-hub",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A persistent multi-server switcher for DeepSeek Harness Web",
   "type": "module",
   "main": "./lib/index.js",

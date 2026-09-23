@@ -248,6 +248,15 @@ async function detectDshInstances(ports) {
   return detected
 }
 
+export function identifyLocalInstance(instance, localPort) {
+  if (instance.port !== localPort) return instance
+  return Object.assign({}, instance, {
+    id: `local-${instance.url}`,
+    label: `主控 :${instance.port}`,
+    source: 'local',
+  })
+}
+
 export function apply(ctx) {
   const initialRunning = []
   for (const session of ctx.sessions.list()) {
@@ -315,8 +324,9 @@ export function apply(ctx) {
     scanning = true
     try {
       const discovery = await listListeningPorts()
-      const candidatePorts = discovery.ports.filter((port) => port !== ctx.webServer.port)
-      const automatic = await detectDshInstances(candidatePorts)
+      const candidatePorts = discovery.ports
+      const automatic = (await detectDshInstances(candidatePorts))
+        .map((instance) => identifyLocalInstance(instance, ctx.webServer.port))
       mergeInstances(automatic)
       discoveryState = {
         source: discovery.source,
@@ -486,13 +496,13 @@ export function apply(ctx) {
       const nextManualPorts = [...new Set(String(requestUrl.searchParams.get('ports') || '')
         .split(',')
         .map((value) => Number(value.trim()))
-        .filter((port) => Number.isInteger(port) && port > 0 && port <= 65535 && port !== ctx.webServer.port))]
+        .filter((port) => Number.isInteger(port) && port > 0 && port <= 65535))]
         .slice(0, 64)
         .sort((a, b) => a - b)
       const manualChanged = nextManualPorts.join(',') !== manualPorts.join(',')
       if (manualChanged) {
         manualPorts = nextManualPorts
-        mergeInstances(monitorInstances.filter((item) => item.source === 'auto'))
+        mergeInstances(monitorInstances.filter((item) => item.source !== 'manual'))
       }
 
       await ensureMonitoring()
@@ -532,8 +542,9 @@ export function apply(ctx) {
 
       try {
         const discovery = await listListeningPorts()
-        const candidatePorts = discovery.ports.filter((port) => port !== ctx.webServer.port)
-        const instances = await detectDshInstances(candidatePorts)
+        const candidatePorts = discovery.ports
+        const instances = (await detectDshInstances(candidatePorts))
+          .map((instance) => identifyLocalInstance(instance, ctx.webServer.port))
         sendJson(res, 200, {
           instances,
           scannedPorts: candidatePorts.length,

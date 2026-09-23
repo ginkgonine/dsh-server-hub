@@ -4,6 +4,7 @@ import {
   apply,
   createStatusTracker,
   deriveSessionRunning,
+  identifyLocalInstance,
   isDshResponse,
   isLoopbackAddress,
   parseListenerPorts,
@@ -26,6 +27,16 @@ test('recognizes authenticated and unauthenticated DSH pages', () => {
   assert.equal(isDshResponse(401, 'dsh web authentication required; reopen the URL printed by dsh web.'), true)
   assert.equal(isDshResponse(200, '<script>window.__DSH_BOOT__ = {}</script>'), true)
   assert.equal(isDshResponse(200, '<html>another app</html>'), false)
+})
+
+test('marks the controller port as a local Hub instance', () => {
+  const remote = { id: 'auto-url', port: 4100, label: 'DSH :4100', url: 'http://127.0.0.1:4100/', source: 'auto' }
+  assert.equal(identifyLocalInstance(remote, 3080), remote)
+
+  const local = identifyLocalInstance({ id: 'auto-local', port: 3080, label: 'DSH :3080', url: 'http://127.0.0.1:3080/', source: 'auto' }, 3080)
+  assert.equal(local.source, 'local')
+  assert.equal(local.label, '主控 :3080')
+  assert.equal(local.id, 'local-http://127.0.0.1:3080/')
 })
 
 test('caps probe response bodies before buffering them', async () => {

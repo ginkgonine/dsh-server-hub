@@ -100,12 +100,13 @@ window.__ModuleLoader__.load({
       if (!Number.isInteger(port) || port < 1 || port > 65535) return null
       const allowed = [`http://127.0.0.1:${port}/`, `http://[::1]:${port}/`]
       if (!allowed.includes(url)) return null
+      const source = item.source === 'manual' ? 'manual' : item.source === 'local' ? 'local' : 'auto'
       return {
         id: url,
         port,
         url,
-        source: item.source === 'manual' ? 'manual' : 'auto',
-        label: preferences.names[url] || preferences.names[String(port)] || `DSH :${port}`,
+        source,
+        label: preferences.names[url] || preferences.names[String(port)] || (source === 'local' ? `主控 :${port}` : `DSH :${port}`),
       }
     }
 
