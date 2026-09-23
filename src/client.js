@@ -12,6 +12,8 @@ window.__ModuleLoader__.load({
     const NOTIFICATION_PREFIX = 'dsh-server-hub.notification.'
     const OVERVIEW_ROUTE = '/api/dsh-server-hub/overview'
     const POLL_MS = 1_000
+    const TITLE_ANIMATION_MS = 140
+    const WORKING_GLYPHS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
     const CSS = `
       .dsh-hub-icon-wrap { position: relative; display: block; width: var(--dsh-hub-icon-size, 24px); height: var(--dsh-hub-icon-size, 24px); color: currentColor; }
@@ -280,11 +282,9 @@ window.__ModuleLoader__.load({
 
     let baseDocumentTitle = window.document.title || 'DeepSeek Harness'
     let lastAppliedTitle = null
+    let titleAnimationFrame = 0
 
-    function updateDocumentTitle(snapshot) {
-      if (lastAppliedTitle !== null && window.document.title !== lastAppliedTitle) {
-        baseDocumentTitle = window.document.title
-      }
+    function formatDocumentTitle(snapshot, fallbackTitle, frame = 0) {
       const active = []
       for (const item of snapshot.instances) {
         const state = snapshot.states[item.id]
@@ -294,13 +294,21 @@ window.__ModuleLoader__.load({
       const waiting = active.filter((entry) => entry.mode === 'waiting')
       const working = active.filter((entry) => entry.mode === 'working')
       const completed = active.filter((entry) => entry.mode === 'completed')
-      let title = baseDocumentTitle
-      if (waiting.length === 1 && working.length === 0) title = `! [${waiting[0].item.label}] 等待操作`
-      else if (waiting.length > 0) title = `! ${waiting.length} waiting${working.length ? ` · ⏳ ${working.length} working` : ''}`
-      else if (working.length === 1) title = `⏳ [${working[0].item.label}] working`
-      else if (working.length > 1) title = `⏳ ${working.length} servers working`
-      else if (completed.length === 1) title = `✓ [${completed[0].item.label}] 已完成`
-      else if (completed.length > 1) title = `✓ ${completed.length} servers completed`
+      const workingGlyph = WORKING_GLYPHS[Math.abs(Number(frame) || 0) % WORKING_GLYPHS.length]
+      if (waiting.length === 1 && working.length === 0) return `❗ [${waiting[0].item.label}] 等待操作`
+      if (waiting.length > 0) return `❗ ${waiting.length} waiting${working.length ? ` · ${workingGlyph} ${working.length} working` : ''}`
+      if (working.length === 1) return `${workingGlyph} [${working[0].item.label}] working`
+      if (working.length > 1) return `${workingGlyph} ${working.length} servers working`
+      if (completed.length === 1) return `✅ [${completed[0].item.label}] 已完成`
+      if (completed.length > 1) return `✅ ${completed.length} servers completed`
+      return fallbackTitle
+    }
+
+    function updateDocumentTitle(snapshot) {
+      if (lastAppliedTitle !== null && window.document.title !== lastAppliedTitle) {
+        baseDocumentTitle = window.document.title
+      }
+      const title = formatDocumentTitle(snapshot, baseDocumentTitle, titleAnimationFrame)
       window.document.title = title
       lastAppliedTitle = title
     }
@@ -380,6 +388,14 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         updateDocumentTitle(snapshot)
+        const working = snapshot.instances.some((item) => statusMode(snapshot.states[item.id]) === 'working')
+        const reducedMotion = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+        if (!working || reducedMotion) return undefined
+        const interval = window.setInterval(() => {
+          titleAnimationFrame = (titleAnimationFrame + 1) % WORKING_GLYPHS.length
+          updateDocumentTitle(snapshot)
+        }, TITLE_ANIMATION_MS)
+        return () => window.clearInterval(interval)
       }, [snapshot])
 
       return null
@@ -642,6 +658,7 @@ window.__ModuleLoader__.load({
     }
 
     exports.apply = apply
+    exports.formatDocumentTitle = formatDocumentTitle
     exports.inject = inject
     return module.exports
   },

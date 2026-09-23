@@ -47,3 +47,18 @@ test('embedded remote pages skip the Hub UI', async () => {
     slots: { inject() { throw new Error('embedded mode must not register slots') } },
   })
 })
+
+test('browser title uses animated working and colored attention glyphs', async () => {
+  const { client } = await loadClientModule()
+  const item = { id: 'server', label: 'V100服务器' }
+  const snapshot = { instances: [item], states: { server: { online: true, workingCount: 1, waitingCount: 0 } } }
+  const first = client.formatDocumentTitle(snapshot, 'DeepSeek Harness', 0)
+  const second = client.formatDocumentTitle(snapshot, 'DeepSeek Harness', 1)
+  assert.notEqual(first, second)
+  assert.match(first, /\[V100服务器\] working$/)
+
+  snapshot.states.server = { online: true, workingCount: 1, waitingCount: 1 }
+  assert.match(client.formatDocumentTitle(snapshot, 'DeepSeek Harness'), /^❗/)
+  snapshot.states.server = { online: true, workingCount: 0, waitingCount: 0, completedUnread: true }
+  assert.match(client.formatDocumentTitle(snapshot, 'DeepSeek Harness'), /^✅/)
+})
