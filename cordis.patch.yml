@@ -1,6 +1,6 @@
 # DSH Server Hub profile bundle.
-# Install this package only on the Windows/main-control DSH profile.
+# Install on the main controller and each monitored remote DSH profile.
 - insert:
     - id: dsh-server-hub
       name: dsh-server-hub
-      inject: [webServer, connection]
+      inject: [webServer, connection, timer, sessions]
