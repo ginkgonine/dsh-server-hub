@@ -1,134 +1,232 @@
-# DSH Server Hub
+# 🚀 DSH Server Hub
 
-为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) Web 提供常驻的多服务器主控界面。
+<p align="center">
+  <strong>专为 DeepSeek Harness Web 打造的多实例 / 多服务器统一控制台与状态雷达</strong>
+</p>
 
-在 Windows PC 上运行一个主控 DSH，将多台远程服务器的 DSH 端口通过 SSH/其他隧道转发到该 PC；本插件自动识别本机监听端口中的 DSH，并在同一个主控外壳里用顶部标签切换。若要显示 Agent 工作、等待人工处理和完成状态，需要在被监控的远程 DSH 上也安装同一插件作为轻量状态桥接端。
+<p align="center">
+  <a href="https://github.com/ginkgonine/dsh-server-hub/releases"><img src="https://img.shields.io/github/v/release/ginkgonine/dsh-server-hub?style=flat-square&label=version" alt="Version"></a>
+  <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DSH-Plugin-purple.svg?style=flat-square" alt="DSH Plugin"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node-%5E22.19%20%7C%7C%20%3E%3D24-brightgreen.svg?style=flat-square" alt="Node Compatibility"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License"></a>
+</p>
 
-## 功能
+---
 
-- 自动读取 Windows、Linux、macOS 的本机 TCP 监听端口。
-- 通过 IPv4/IPv6 loopback 探测 DSH 启动页或认证响应；主控自身端口也会作为“主控”服务器显示并参与 Agent 状态统计。
-- 左侧栏提供紧凑的服务器 Hub 入口。
-- 顶部横向标签切换服务器，主控外壳不会整页跳转。
-- Hub 面板内的服务器 iframe 保持挂载并在后台预载；服务器标签间切换时使用短暂淡入，避免深色模式下出现白屏闪烁。
-- 支持手动添加隧道端口。
-- 支持自定义服务器名称，例如“197服务器”。
-- 自定义名称和手动端口保存在浏览器 `localStorage` 中。
-- 服务器标签显示 Agent 的工作中、等待授权/回答、已完成和离线状态。
-- Hub 顶部、侧栏图标和浏览器标签页标题会同步汇总多服务器状态；标签页工作态使用动态字符，等待和完成态分别使用彩色 `❗`、`✅`。
-- 可由用户主动启用 Windows 浏览器通知；等待人工处理和任务结束使用不同通知。
+## 💡 DSH Server Hub 解决哪些问题？
 
-## 架构
+当你在**本地并行开发多个项目**，或在**多台远程 GPU/开发服务器**上同时跑 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) 任务时，常常被两件事困扰：
+
+1. **“标签页地狱”**：浏览器里开了一整排 DSH 网页，所有 Tab 都千篇一律叫“DeepSeek Harness”，每次找项目或机器都得抓周；切换时还会伴随页面重载与白屏闪烁。
+2. **“盲盒式巡检”**：离开网页后，你根本不知道哪个实例的 Agent 跑完了、哪台正卡在**“等待人工授权/提问”**环节，只能隔一会儿挨个切回去肉眼翻查。
+
+**DSH Server Hub** 将本地运行的所有 DSH 实例以及通过隧道转发到本机的远程 DSH 节点，全部聚合进同一个原生工作台中。**自动识别端口、单页无感热切、全矩阵 Agent 状态雷达与全局被动唤醒**，让你在一个窗口内从容调度全部算力与会话。
+
+> 📌 **按需安装，轻重随心**：
+> * **基础多实例/多服切换（Hub）**：**仅需在本地主控端安装！** 其它本地实例或远端服务器无需任何插件，只要端口在本机处于监听状态，即可立刻享受单页聚合与多标签切换；
+> * **全景状态雷达与提醒**：如果你想在标签栏、浏览器 Tab 和桌面弹窗上实时看到各个实例的 Agent 运行状态（是否正在运行、是否卡在等待授权），只需在对应实例上也安装该插件即可。
+
+---
+
+## 🖼️ 界面预览
+
+![DSH Server Hub 主界面](./docs/screenshots/hub-main.png)
+
+浏览器标签页会跟随多服务器 Agent 状态自动变化：
+
+| 工作中 | 等待人工操作 | 已完成 |
+| :---: | :---: | :---: |
+| ![多个服务器工作中](./docs/screenshots/tab-working.png) | ![等待人工操作与服务器工作中](./docs/screenshots/tab-waiting.png) | ![多个服务器已完成](./docs/screenshots/tab-completed.png) |
+
+---
+
+## ✨ 核心特性
+
+### 🔍 自动感知，开箱即用 (Zero-Config Auto Discovery)
+* **智能本地扫描**：原生探测跨平台（Windows / Linux / macOS）的本机 TCP 监听端口，自动识别本机启动的其他 DSH 实例或通过 SSH 隧道映射到本机的实例，免去繁琐配置。
+* **灵活补充 & 个性命名**：支持手动追加指定端口；支持给每台实例/服务器自定义直观名称（如 `本地-电商重构`、`A100-训练机`、`4090-测试节点`），配置持久化保存于浏览器本地，重启不丢。
+
+### ⚡ 无缝热切，零白屏闪烁 (Seamless Hot Switching)
+* **常驻 Iframe 后台热载**：所有实例在后台保持挂载，切换标签时不会主动重新加载，上下文、聊天记录与输入框草稿均可保留。
+* **深色模式体验调优**：内置平滑过渡与暗色防闪烁机制，彻底告别 iframe 切换时的刺眼白屏。
+
+### 🧭 全矩阵 Agent 状态雷达 (Status Radar)
+各实例的 Agent 动向尽收眼底，一眼看透全局进度：
+* 🏃 **正在工作**：工具调用与推理进行中（Hub 标签显示旋转指示器，提示活跃任务数）
+* ❗ **等待确认**：Agent 卡在危险操作授权或需要人工输入（琥珀色高亮呼吸，优先提醒）
+* ✅ **任务完成**：任务闭环结束，状态即时同步
+* 💤 **空闲 / 离线**：清晰区分就绪与连接中断状态
+
+### 📑 浏览器标签页智能同步 (Smart Browser Tab)
+无需切回网页，看一眼浏览器 Tab 标题就能洞察一切：
+* 🏃 **有任务在跑**：浏览器 Tab 标题前缀显示**动态旋转字符**（`⠋` ➔ `⠙` ➔ `⠹` ➔ `⠸`...），直观感知后台仍在全力运转；
+* ❗ **需要人工介入**：只要有任意一个实例卡在等待授权，Tab 标题立刻醒目标注彩色 `❗`；
+* ✅ **任务圆满完成**：有实例产生新的任务完成状态后，自动呈现 `✅` 提示交付。
+
+### 🔔 全局桌面被动唤醒 (Desktop Notifications)
+* **精准桌面弹窗**：在需要人工授权或任务结束时，主动推送到系统通知中心，不同事件类型区分弹窗提示。写代码或摸鱼时不再需要频繁肉眼巡检，有事它会自动叫你。
+* **全生命周期守护**：即使你暂时切出 Hub 面板回到普通聊天窗口，底层的监控器依然在后台静默运行，保证提醒不漏接。
+
+---
+
+## 📐 架构与工作拓扑
 
 ```text
-Windows PC
-├── DSH 主控 + dsh-server-hub（发现、轮询、Hub UI）
-├── 127.0.0.1:3101 ── tunnel ── 服务器 A 的 DSH + dsh-server-hub（状态桥接）
-├── 127.0.0.1:3102 ── tunnel ── 服务器 B 的 DSH + dsh-server-hub（状态桥接）
-└── 浏览器
-    └── 主控外壳
-        ├── 常驻状态监控器
-        ├── 主控自身 iframe（嵌入模式不再注册 Hub，避免递归）
-        ├── 服务器 A iframe
-        └── 服务器 B iframe
+┌─────────────────────────────────────────────────────────────────┐
+│  本地工作站 (Windows / macOS / Linux PC)                         │
+│                                                                 │
+│   DSH 主控 Web ── 侧栏入口: [服务器 Hub]                          │
+│   │                                                             │
+│   ├── 聚合标签 [主控本机] [本地项目B] [A100训练机] [测试节点]    │
+│   │                                                             │
+│   └── 常驻监控调度器 (Host + Client Overlay)                     │
+│         │ (每30s自动扫描端口 / 约每1.5s轻量状态轮询)             │
+│         │                                                       │
+│         ├── 127.0.0.1:3001 (本机另一个项目目录跑的 DSH)         │
+│         │                                                       │
+│         ├── 127.0.0.1:3101 (SSH 隧道) ── 远程服务器 A (带插件)  │
+│         │                                                       │
+│         └── 127.0.0.1:3102 (SSH 隧道) ── 远程服务器 B (纯 DSH)  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-主控 Host 在浏览器首次连接状态总览后启动常驻监控：每 30 秒重新发现端口，并约每 1.5 秒轮询主控自身和现有转发端口的状态桥接端。桥接端只返回工作数、等待数和完成序号等最小聚合数据，不传输会话正文。Client 在 `shell.overlay` 中挂载不可见监控器，因此离开 Hub 面板后，浏览器标题和桌面通知仍能继续工作。
+---
 
-## 安装
+## 🚀 极速上手
 
-### 从 GitHub 安装
+### 步骤 1：安装插件
+
+#### 1. 本地主控端（必选）
+在作为主控的 DSH 实例上安装，启用 Hub 面板与智能发现：
 
 ```bash
 dsh plugin --profile web add github:ginkgonine/dsh-server-hub
-```
-
-`dsh-server-hub` 是 Profile Bundle，`dsh plugin` 会把它加入 Web profile 的 bundle 列表。主控必须安装；需要状态监控的每台远程 DSH 也执行同一安装命令。远端页面被 Hub iframe 嵌入时不会渲染第二套 Hub UI，只运行 Host 状态桥接。
-
-安装完成后重启对应的 DSH：
-
-```bash
 dsh web
 ```
 
-### 从本地源码安装
+#### 2. 被监控端（可选）
+如果希望监控某个实例（本地或远程）的 Agent 工作/等待/完成状态，在该实例上也执行安装并重启对应的 DSH Web：
 
 ```bash
-git clone https://github.com/ginkgonine/dsh-server-hub.git
-cd dsh-server-hub
-npm run check
-dsh plugin --profile web add .
+dsh plugin --profile web add github:ginkgonine/dsh-server-hub
+# 停止旧进程后重新启动
+dsh web
 ```
 
-然后重启 `dsh web`。
+*(被 Hub 嵌入时会自动切换为纯后台轻量桥接模式，不产生冗余 UI)*
 
-### 验证组合
+### 步骤 2：启动更多实例（本机多开 或 远程隧道）
+
+无论是本地多开还是远程映射，只要端口在本地处于监听状态，Hub 都会自动发现：
+
+* **方式 A：本机多实例并行（多项目开发）**
+  在另一个项目目录中，以指定端口启动第二个 DSH：
+  ```bash
+  cd ~/another-project
+  dsh web --port 3001
+  ```
+
+* **方式 B：远程服务器映射（多服务器集群）**
+  通过 SSH 将远端 DSH 服务的端口映射到本地的独立端口：
+  ```bash
+  # 将远程服务器 A、B 分别映射到本地 3101 和 3102 端口
+  ssh -N -L 3101:127.0.0.1:3080 user@server-a.internal
+  ssh -N -L 3102:127.0.0.1:3080 user@server-b.internal
+  ```
+
+### 步骤 3：即刻掌控
+
+1. 打开主控 DSH Web 页面，在左侧导航栏点击 **「服务器 Hub」**；
+2. 插件会自动探测到刚才启动或映射的所有本地端口，并生成标签页；
+3. 点击 **「命名」** 为每个实例设置易记别名（如 `本地-前端重构`、`A100-训练`）；
+4. 点击工具栏的 **「通知」** 授予浏览器通知权限，激活桌面弹窗；
+5. 开启高能并行开发！
+
+---
+
+## ⚙️ 常用操作与配置
+
+| 操作 | 说明 |
+| :--- | :--- |
+| **切换实例** | 点击顶部标签，即开即切，各实例上下文与草稿均完整保留 |
+| **命名实例** | 选中标签后点击「命名」，输入自定义别名（持久化于本地浏览器缓存） |
+| **手动添加端口** | 若使用了特殊端口或未自动列出，在输入框填写端口号并回车即可直连 |
+| **桌面通知授权** | 点击工具栏「通知」按钮，浏览器授权后生效，等待操作与任务完成均有专属弹窗 |
+| **返回主控会话** | 点击工具栏「主控」或左侧普通会话即可离开 Hub，后台监控依然在浏览器 Tab 标题与通知中生效 |
+
+### 更新插件
+
+在主控以及已安装状态桥接的被监控端分别执行：
 
 ```bash
-dsh --profile web --dump-config
+dsh plugin --profile web update dsh-server-hub
 ```
 
-输出中应包含：
+更新后停止旧进程并重新运行 `dsh web`。如果主控与远端暂时没有同时更新，已有的 v1 状态协议仍可继续通信，但建议最终保持版本一致。
 
-```yaml
-- id: dsh-server-hub
-  name: dsh-server-hub
-```
-
-### 卸载
+### 卸载插件
 
 ```bash
 dsh plugin --profile web remove dsh-server-hub
 ```
 
-卸载后重启 DSH。
+卸载后同样需要重启对应的 DSH Web。远端卸载后仍可在 Hub 中打开，但不再提供 Agent 状态和通知；主控卸载后 Hub 入口会消失。
 
-## 使用
+---
 
-1. 在主控和需要监控的远端 DSH 上安装插件。
-2. 在主控 PC 上启动所有端口转发。
-3. 打开主控 DSH，点击左侧“服务器 Hub”。
-4. 插件会自动扫描；也可以在顶部手动输入端口。
-5. 选择服务器后点击“命名”，设置易辨识的名称。
-6. 点击“通知”并允许浏览器通知，即可接收 Windows 桌面提示。
-7. 点击“主控”返回主控 DSH 会话；后台状态监控仍会继续。
+## 🔒 安全与网络设计
 
-## 已知限制
+* **零会话隐私侵入**：状态桥接端只返回约每 1.5 秒轮询一次的轻量聚合状态（当前工作任务数、等待确认数、完成事件序列号等），不传输聊天记录、提示词、工具参数或输出日志。
+* **分层访问控制**：扫描和状态总览 API 使用 DSH 的登录校验；供主控 Host 轮询的 `/api/dsh-server-hub/status` 仅接受无浏览器 `Origin` 的 Loopback GET/HEAD 请求（`127.0.0.1` / `::1`）。
+* **反向代理提醒**：不要把状态桥接端点放在会将外部请求转换成 Loopback 来源的本机反向代理后面；如确有需要，应在代理层额外配置身份验证和访问控制。
+* **低负载防护**：
+  * 状态响应体最大读取 16 KiB，HTTP 探测超时为 1.2 秒且禁止跟随重定向；
+  * 端口探测并发数限制为 24，探测范围上限 256 个本机监听端口；
+  * 手动添加端口上限 64 个，且仍限定为 Loopback HTTP。
 
-- 自动扫描发生在运行主控 DSH 的机器上。插件部署在 Linux 服务器时，看不到 Windows PC 上的本地隧道端口。
-- 目标 DSH 必须允许被 iframe 嵌入。如果目标响应设置了阻止嵌入的 CSP `frame-ancestors` 或 `X-Frame-Options`，需要改用主控反向代理方案。
-- 自动探测仅访问 `127.0.0.1` 和 `::1`；只绑定其他网卡地址、HTTPS 或非 loopback 的场景需要后续增加完整 URL 配置。
-- 未安装插件的远端仍可切换和使用，但状态会显示为“未安装状态桥接插件”，不会产生 Agent 状态通知。
-- Windows 通知权限必须由用户点击“通知”主动授予；拒绝后需在浏览器站点设置中恢复。
+---
 
-## 开发
+## ⚠️ 已知限制
 
-本仓库提交了可直接安装的 `lib/` 产物。构建过程不依赖私有 DSH 构建工具：Host 使用标准 ESM，Client 使用 DSH 的 `window.__ModuleLoader__` 模块包装格式。
+* 自动扫描发生在**主控 DSH 进程所在的机器**。如果主控运行在 Linux 服务器上，它无法看到浏览器所在 Windows PC 的本地隧道端口。
+* 自动探测仅访问 `127.0.0.1` 和 `::1` 上的 HTTP 服务；仅绑定其他网卡地址、HTTPS 或任意完整 URL 的场景暂不支持。
+* 目标 DSH 必须允许 iframe 嵌入。若响应包含 `X-Frame-Options: DENY` 或严格的 CSP `frame-ancestors`，需调整代理响应头或采用主控反向代理方案。
+* 未安装插件的实例仍可打开和切换，但不提供 Agent 状态、浏览器标题汇总和桌面通知。
+* 桌面通知必须由用户点击「通知」主动授权；若曾拒绝，需要在浏览器站点设置中恢复权限。
+
+---
+
+## 🛠️ 开发者指南
+
+本项目已包含预构建的发布产物（位于 `lib/`）。构建过程完全基于标准 ESM 与 DSH 模块规范，不依赖闭源私有工具链。
 
 ```bash
+# 1. 克隆代码仓库
+git clone https://github.com/ginkgonine/dsh-server-hub.git
+cd dsh-server-hub
+
+# 2. 构建与运行测试
 npm run build
 npm test
 npm run check
+
+# 3. 安装本地源码版本至 DSH
+dsh plugin --profile web add .
 ```
 
-项目结构：
+### 目录结构
 
 ```text
-src/index.js      Host：端口发现、状态桥接、常驻轮询与受保护 API
-src/client.js     Client：Slot UI、iframe Hub、标题/通知与本地名称配置
-cordis.patch.yml  Web profile bundle patch
-scripts/build.mjs 生成 lib/ 发布产物
+├── src/
+│   ├── index.js        # Host 端：端口智能发现、极轻状态桥接、常驻监控与受保护 API
+│   └── client.js       # Client 端：Slot 注入、iframe 容器组、状态动效与通知控制
+├── lib/                # 预编译产物目录
+├── cordis.patch.yml    # Web profile 插件描述补丁
+└── scripts/build.mjs   # 轻量构建脚本
 ```
 
-## 安全说明
+---
 
-- 扫描和状态总览 API 会经过 DSH `connection.requestRejection()` 登录校验。
-- 远端 `/api/dsh-server-hub/status` 只接受无 `Origin` 的 loopback GET/HEAD 请求，供 SSH 转发后的主控 Host 轮询；不会开放浏览器跨域访问。
-- 不要把该状态端点放在会把外部请求转成 loopback 来源的本机反向代理后面；需要反向代理时应另外增加访问控制。
-- 状态桥接只返回进程纪元、聚合数字、递增序号和结束原因，不返回会话 ID、标题、消息或工具参数。
-- 只探测系统已经处于监听状态的本机 TCP 端口，最多 256 个；手动端口最多 64 个且仍限定 loopback HTTP。
-- HTTP 探测有 1.2 秒超时和流式读取上限；状态轮询限制为 16 KiB、禁止重定向，并限制并发数。
+## 📄 开源许可证
 
-## License
-
-[MIT](LICENSE)
+本项目基于 [MIT 许可证](LICENSE) 开源。
