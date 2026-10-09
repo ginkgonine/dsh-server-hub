@@ -94,6 +94,17 @@
 
 ## 🚀 极速上手
 
+### DSH 版本兼容
+
+插件 `0.2.3` 已按 [DSH `0.2.0-rc.2` 发布包](https://www.npmjs.com/package/@deepseek-ai/dsh/v/0.2.0-rc.2) 的接口适配，同时保留 `0.1.5` 系列支持。
+
+* 更新 DSH peer 范围，避免新版安装/启动兼容性校验拒绝加载（optional peer 也参与 DSH 校验），无需使用版本豁免。
+* Host 使用 `agents.list()` / `agent.status` 和 `agent/status` 跟踪真实生命周期，不再依赖 Web API 投影事件或历史 turn 日志推断状态。
+* Web API 请求使用文档相对路径，支持将主控页面部署到带尾部 `/` 的反向代理子路径；代理仍需把该前缀剥离后转发到 DSH。
+* 最新版 `layout.selectPanel`、Slot 注册和 `__ModuleLoader__` 接口仍兼容，保留原有前端加载方式和 v1 状态协议。
+
+运行 `npm run check` 可验证构建、生命周期/等待状态回归、Slot 注册及根路径/代理子路径请求。接口核对与自动化回归不等同于真实浏览器端到端验收。
+
 ### 步骤 1：安装插件
 
 #### 1. 本地主控端（必选）

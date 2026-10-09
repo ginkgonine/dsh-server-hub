@@ -20,16 +20,18 @@ async function loadClientModule() {
   globalThis.window = windowStub
   loadSequence += 1
   await import(`../src/client.js?test=${loadSequence}`)
+  const effects = []
   const React = {
-    createElement() {},
-    useEffect() {},
+    createElement(type, props) { return { type, props } },
+    useEffect(callback) { effects.push(callback) },
+    useSyncExternalStore(_subscribe, getSnapshot) { return getSnapshot() },
     useState(value) { return [typeof value === 'function' ? value() : value, () => {}] },
   }
   const client = definition.factory((name) => {
     assert.equal(name, 'react')
     return React
   })
-  return { client, definition, windowStub }
+  return { client, definition, windowStub, effects }
 }
 
 test('exports a top-level Hub client package', async () => {
@@ -46,6 +48,45 @@ test('embedded remote pages skip the Hub UI', async () => {
     effect() { throw new Error('embedded mode must not register effects') },
     slots: { inject() { throw new Error('embedded mode must not register slots') } },
   })
+})
+
+test('registers compatible slots and polls within root and proxy mounts', async () => {
+  for (const base of ['http://localhost:3080/', 'https://example.test/dsh/']) {
+    const { client, windowStub, effects } = await loadClientModule()
+    const slots = new Map()
+    const injected = []
+    const selected = []
+    let requested
+    let cleared = false
+    windowStub.document.baseURI = base
+    windowStub.document.createElement = () => ({ dataset: {}, remove() {} })
+    windowStub.document.head = { appendChild() {} }
+    windowStub.setInterval = () => 1
+    windowStub.clearInterval = () => { cleared = true }
+    windowStub.fetch = async (url, options) => {
+      requested = new URL(url, windowStub.document.baseURI).href
+      assert.equal(options.credentials, 'same-origin')
+      return { ok: true, json: async () => ({ instances: [], states: {} }) }
+    }
+    client.apply({
+      effect(callback) { return callback() },
+      layout: { selectPanel(id) { selected.push(id) } },
+      slots: {
+        inject(name, callback) { injected.push(name); callback() },
+        register(options, component) { slots.set(options.name, { options, component }); return () => {} },
+      },
+    })
+    assert.deepEqual(injected, ['shell.overlay', 'sidebar.panellist', 'main'])
+    assert.equal(slots.get('main').options.key, slots.get('sidebar.panellist').options.id)
+    const monitor = slots.get('shell.overlay').component()
+    monitor.type(monitor.props)
+    const cleanup = effects[0]()
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(requested, `${base}api/dsh-server-hub/overview?`)
+    cleanup()
+    assert.equal(cleared, true)
+    assert.deepEqual(selected, [])
+  }
 })
 
 test('browser title uses animated working and colored attention glyphs', async () => {

@@ -3,4 +3,4 @@
 - insert:
     - id: dsh-server-hub
       name: dsh-server-hub
-      inject: [webServer, connection, timer, sessions]
+      inject: [webServer, connection, timer, agents]

@@ -119,8 +119,8 @@ test('status bridge rejects browser origins and non-loopback callers', () => {
       },
     },
     connection: { requestRejection: () => undefined },
-    sessions: {
-      list: () => [{ id: 'session-running', ownEvents: () => [{ type: 'turn/start' }] }],
+    agents: {
+      list: () => [{ id: 'session-running', status: 'running' }],
     },
     get: () => undefined,
     on: () => () => true,
@@ -146,4 +146,57 @@ test('status bridge rejects browser origins and non-loopback callers', () => {
   assert.equal(status.version, 1)
   assert.equal(typeof status.epoch, 'string')
   assert.equal(status.workingCount, 1)
+})
+
+test('tracks Agent lifecycle rather than historical turns or Web projection events', async () => {
+  const routes = new Map()
+  const listeners = new Map()
+  const running = { id: 'running', status: 'running' }
+  const idle = { id: 'idle', status: 'idle', session: { ownEvents: () => [{ type: 'turn/start' }] } }
+  apply({
+    agents: { list: () => [running, idle] },
+    webServer: { port: 3080, register(route) { routes.set(route.path, route.handler); return () => {} } },
+    connection: { requestRejection: () => undefined },
+    on(event, listener, options) {
+      assert.equal(options.global, true)
+      listeners.set(event, listener)
+      return () => {}
+    },
+    effect(callback) { return callback() },
+    interval: () => () => {},
+  })
+  const snapshot = () => {
+    const res = responseRecorder()
+    routes.get('/api/dsh-server-hub/status')({ method: 'GET', headers: {}, socket: { remoteAddress: '127.0.0.1' } }, res)
+    return JSON.parse(res.body)
+  }
+  assert.equal(listeners.has('api-session/status'), false)
+  assert.equal(snapshot().workingCount, 1)
+  const created = { id: 'created', status: 'running' }
+  listeners.get('agent/created')({ agent: created })
+  assert.equal(snapshot().workingCount, 2)
+  listeners.get('agent/status')({ agent: running, status: 'idle' })
+  assert.equal(snapshot().completionSeq, 0)
+  listeners.get('session/event')({}, { type: 'turn/end', data: { reason: { kind: 'cancelled' } } })
+  listeners.get('agent/status')({ agent: created, status: 'idle' })
+  assert.equal(snapshot().workingCount, 0)
+  assert.equal(snapshot().completionSeq, 1)
+  assert.equal(snapshot().lastOutcome, 'cancelled')
+
+  for (const event of ['approval/request', 'user-questions/request']) {
+    await assert.rejects(listeners.get(event)({ agent: created }, async () => {
+      assert.equal(snapshot().waitingCount, 1)
+      throw new Error('cancelled')
+    }), /cancelled/)
+    assert.equal(snapshot().waitingCount, 0)
+  }
+  assert.equal(await listeners.get('user-questions/request')({}, async () => 'answer'), 'answer')
+  assert.equal(snapshot().waitingCount, 0)
+
+  listeners.get('agent/status')({ agent: running, status: 'running' })
+  listeners.get('agent/status')({ agent: running, status: 'running' })
+  assert.equal(snapshot().workingCount, 1)
+  listeners.get('agent/disposed')({ agent: running })
+  assert.equal(snapshot().workingCount, 0)
+  assert.equal(snapshot().completionSeq, 1)
 })

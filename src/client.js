@@ -10,7 +10,8 @@ window.__ModuleLoader__.load({
     const PANEL_ID = 'dsh-server-hub'
     const STORAGE_KEY = 'dsh-server-hub.preferences.v1'
     const NOTIFICATION_PREFIX = 'dsh-server-hub.notification.'
-    const OVERVIEW_ROUTE = '/api/dsh-server-hub/overview'
+    // Document-relative paths preserve reverse-proxy mounts used by DSH Web.
+    const OVERVIEW_ROUTE = 'api/dsh-server-hub/overview'
     const POLL_MS = 1_000
     const TITLE_ANIMATION_MS = 140
     const WORKING_GLYPHS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
