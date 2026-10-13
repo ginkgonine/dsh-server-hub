@@ -147,7 +147,7 @@ test('a registered missing-dir workspace is rejected without recreating its dire
   assert.equal(f.writes.length, 0)
 })
 
-test('approval and questions use existing answerers; overlapping waits produce no further prompts', async t => {
+test('legacy status-only fixtures use existing answerers; overlapping waits produce no further prompts', async t => {
   const f = fixture(t)
   const run = await f.worker.start(f.input)
   const agent = f.agents.get(run.sessionId)
@@ -329,4 +329,232 @@ test('late session creation after cancellation is never prompted', async t => {
   await f.archived.promise
   assert.equal(f.prompts.length, 0)
   assert.deepEqual(f.cancels.map(value => value.id), [input.sessionId])
+})
+
+const questionRequest = agent => ({ agent, questions: [{ id: 'mode', question: 'Which mode?', detail: 'Choose safely',
+  options: [{ label: 'Safe', description: 'Read only' }, { label: 'Fast' }], multiSelect: false }] })
+const approvalRequest = agent => ({ agent, toolName: 'bash', callId: 'remote-call', reason: 'Needs permission',
+  displayReason: { en: 'Allow?', 'zh-CN': '允许？' } })
+const safeAnswer = () => ({ answers: [{ id: 'mode', selected: ['Safe'] }] })
+const interactionChange = (worker, count, state) => new Promise(resolve => {
+  const listener = async runId => {
+    const run = await worker.get(runId)
+    if (run.requests.length === count && (!state || run.state === state)) {
+      worker.events.off('changed', listener); resolve(run)
+    }
+  }
+  worker.events.on('changed', listener)
+})
+
+test('real ordinary question is claimed, whitelisted and answered through its original deferred, not another prompt', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
+  const cycle = {}; cycle.self = cycle
+  const request = { ...questionRequest(agent), signal: new AbortController().signal, extra: cycle }
+  request.questions[0].extra = cycle
+  const waiting = interactionChange(f.worker, 1, 'waiting_input')
+  const answer = f.hooks.get('user-questions/request')(request, () => assert.fail('owned question must not reach remote UI'))
+  const snapshot = await waiting, [pending] = snapshot.requests
+  assert.match(pending.id, /^request-/)
+  assert.deepEqual(pending.questions, questionRequest(agent).questions)
+  assert.equal(pending.requiresHuman, false)
+  assert.equal('agent' in pending, false)
+  assert.equal('signal' in pending, false)
+  assert.ok(snapshot.revision > run.revision)
+  const resumed = await f.worker.respond(run.runId, pending.id, safeAnswer())
+  assert.equal(resumed.state, 'running')
+  assert.deepEqual(resumed.requests, [])
+  assert.deepEqual(await answer, safeAnswer())
+  assert.equal(f.creates.length, 1)
+  assert.equal(f.prompts.length, 1)
+  assert.ok(resumed.revision > snapshot.revision)
+  assert.equal('responseReceipts' in resumed, false)
+})
+
+test('overlapping real questions and approval prioritize approval, and only the human path grants', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
+  const first = interactionChange(f.worker, 1, 'waiting_input')
+  const question = f.hooks.get('user-questions/request')(questionRequest(agent), () => assert.fail('no remote UI'))
+  const questionId = (await first).requests[0].id
+  const second = interactionChange(f.worker, 2, 'waiting_approval')
+  const approval = f.hooks.get('approval/request')(approvalRequest(agent), () => assert.fail('no remote UI'))
+  const approvalId = (await second).requests.find(request => request.kind === 'approval').id
+  await assert.rejects(f.worker.respond(run.runId, approvalId, { outcome: 'allowed-once' }), { code: 'REMOTE_HUMAN_REQUIRED' })
+  assert.equal((await f.worker.get(run.runId)).requests.length, 2)
+  const remaining = await f.worker.respond(run.runId, approvalId, { outcome: 'allowed-once' }, { human: true })
+  assert.equal(await approval, 'allowed-once')
+  assert.equal(remaining.state, 'waiting_input')
+  await f.worker.respond(run.runId, questionId, safeAnswer())
+  assert.deepEqual(await question, safeAnswer())
+  assert.equal((await f.worker.get(run.runId)).state, 'running')
+  assert.equal(f.prompts.length, 1)
+})
+
+test('intent-bearing questions retain native detail and intent but reject the ordinary reply channel', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
+  const request = questionRequest(agent)
+  request.questions[0].intent = { kind: 'plan-review', approve: 'Safe', callId: 'plan-call' }
+  const waiting = interactionChange(f.worker, 1)
+  const answer = f.hooks.get('user-questions/request')(request, () => assert.fail('no next'))
+  const [pending] = (await waiting).requests
+  assert.equal(pending.requiresHuman, true)
+  assert.deepEqual(pending.questions[0].intent, request.questions[0].intent)
+  await assert.rejects(f.worker.respond(run.runId, pending.id, safeAnswer()), { code: 'REMOTE_HUMAN_REQUIRED' })
+  await f.worker.respond(run.runId, pending.id, safeAnswer(), { human: true })
+  assert.deepEqual(await answer, safeAnswer())
+})
+
+test('response receipts durably deduplicate identical concurrent answers and reject conflicts, including after restart', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
+  const waiting = interactionChange(f.worker, 1)
+  const answer = f.hooks.get('user-questions/request')(questionRequest(agent), () => assert.fail('no next'))
+  const [pending] = (await waiting).requests
+  const [first, duplicate] = await Promise.all([
+    f.worker.respond(run.runId, pending.id, safeAnswer()), f.worker.respond(run.runId, pending.id, safeAnswer()),
+  ])
+  assert.equal(first.revision, duplicate.revision)
+  assert.deepEqual(await answer, safeAnswer())
+  assert.equal(typeof f.data.get(run.runId).responseReceipts[pending.id].digest, 'string')
+  await assert.rejects(f.worker.respond(run.runId, pending.id, { answers: [{ id: 'mode', selected: ['Fast'] }] }), { code: 'REMOTE_CONFLICT' })
+  const restored = fixture(t, [...f.data.values()])
+  const replay = await restored.worker.respond(run.runId, pending.id, safeAnswer())
+  assert.equal(replay.state, 'interrupted')
+  assert.deepEqual(replay.requests, [])
+  assert.equal(restored.prompts.length, 0)
+})
+
+test('request signal abort immediately withdraws questions and approvals and rejects stale authorization', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
+  const questionSignal = new AbortController(), approvalSignal = new AbortController()
+  const waiting = interactionChange(f.worker, 2, 'waiting_approval')
+  const question = f.hooks.get('user-questions/request')({ ...questionRequest(agent), signal: questionSignal.signal }, () => assert.fail('no next'))
+  const rejected = assert.rejects(question, { name: 'UserQuestionError', code: 'ASK_ABORTED' })
+  const approval = f.hooks.get('approval/request')({ ...approvalRequest(agent), signal: approvalSignal.signal }, () => assert.fail('no next'))
+  const snapshot = await waiting
+  questionSignal.abort()
+  approvalSignal.abort()
+  await rejected
+  assert.equal(await approval, 'cancelled')
+  await f.worker.tail
+  assert.deepEqual((await f.worker.get(run.runId)).requests, [])
+  for (const request of snapshot.requests) await assert.rejects(f.worker.respond(run.runId, request.id,
+    request.kind === 'approval' ? { outcome: 'allowed-once' } : safeAnswer(), { human: true }), { code: 'REMOTE_REQUEST_EXPIRED' })
+  assert.equal(f.prompts.length, 1)
+})
+
+test('pre-aborted and timeout signals never leave a question hung', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
+  const aborted = new AbortController(); aborted.abort()
+  await assert.rejects(f.hooks.get('user-questions/request')({ ...questionRequest(agent), signal: aborted.signal }, () => assert.fail('no next')),
+    { name: 'UserQuestionError', code: 'ASK_ABORTED' })
+  assert.equal(await f.hooks.get('approval/request')({ ...approvalRequest(agent), signal: aborted.signal }, () => assert.fail('no next')), 'cancelled')
+  const signal = AbortSignal.timeout(10)
+  const keepAlive = setTimeout(() => {}, 50)
+  try {
+    await assert.rejects(f.hooks.get('user-questions/request')({ ...questionRequest(agent), signal }, () => assert.fail('no next')),
+      { name: 'UserQuestionError', code: 'ASK_ABORTED' })
+    await f.worker.tail
+    assert.deepEqual((await f.worker.get(run.runId)).requests, [])
+  } finally { clearTimeout(keepAlive) }
+})
+
+test('worker cancellation and close settle every owned deferred without relying on an answerer or signal', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
+  const waiting = interactionChange(f.worker, 2)
+  const question = f.hooks.get('user-questions/request')(questionRequest(agent), () => assert.fail('no next'))
+  const rejected = assert.rejects(question, { code: 'ASK_ABORTED' })
+  const approval = f.hooks.get('approval/request')(approvalRequest(agent), () => assert.fail('no next'))
+  const snapshot = await waiting
+  await f.worker.cancel(run.runId)
+  await rejected
+  assert.equal(await approval, 'cancelled')
+  assert.deepEqual((await f.worker.get(run.runId)).requests, [])
+  await assert.rejects(f.worker.respond(run.runId, snapshot.requests[1].id, { outcome: 'allowed-once' }, { human: true }), { code: 'REMOTE_REQUEST_EXPIRED' })
+  const second = await f.worker.start({ ...f.input, runId: 'run-2' })
+  const secondWaiting = interactionChange(f.worker, 1)
+  const another = f.hooks.get('approval/request')(approvalRequest(f.agents.get(second.sessionId)), () => assert.fail('no next'))
+  await secondWaiting
+  await f.worker.close()
+  assert.equal(await another, 'cancelled')
+  assert.deepEqual((await f.worker.get(second.runId)).requests, [])
+})
+
+test('eight-pending capacity and payload limits fail closed, never delegate malformed real approvals', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
+  const waiting = interactionChange(f.worker, 8)
+  const pending = Array.from({ length: 8 }, () => f.hooks.get('approval/request')(approvalRequest(agent), () => assert.fail('no next')))
+  await waiting
+  assert.equal(await f.hooks.get('approval/request')(approvalRequest(agent), () => assert.fail('no next')), 'unavailable')
+  await assert.rejects(f.hooks.get('user-questions/request')(questionRequest(agent), () => assert.fail('no next')), { code: 'REMOTE_INPUT' })
+  assert.equal(await f.hooks.get('approval/request')({ agent, toolName: '', secret: true }, () => assert.fail('malformed must not delegate')), 'unavailable')
+  await assert.rejects(f.hooks.get('user-questions/request')({ agent, questions: [{ id: 'mode', question: 'a'.repeat(40000) }] }, () => assert.fail('no next')), { code: 'REMOTE_INPUT' })
+  await f.worker.cancel(run.runId)
+  assert.deepEqual(await Promise.all(pending), Array(8).fill('cancelled'))
+})
+
+test('restart clears pending questions/approval without recreating, prompting or accepting a stale decision', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
+  const waiting = interactionChange(f.worker, 1)
+  const original = f.hooks.get('approval/request')(approvalRequest(agent), () => assert.fail('no next'))
+  const [pending] = (await waiting).requests
+  const restored = fixture(t, [...f.data.values()])
+  await restored.worker.initialize()
+  const recovered = await restored.worker.get(run.runId)
+  assert.equal(recovered.state, 'interrupted')
+  assert.deepEqual(recovered.requests, [])
+  assert.equal(restored.creates.length, 0)
+  assert.equal(restored.prompts.length, 0)
+  await assert.rejects(restored.worker.respond(run.runId, pending.id, { outcome: 'allowed-once' }, { human: true }), { code: 'REMOTE_REQUEST_EXPIRED' })
+  await f.worker.close()
+  assert.equal(await original, 'cancelled')
+})
+
+test('same-id but non-owned Agent identity delegates real interactions unchanged', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input)
+  const other = { id: run.sessionId }
+  assert.equal(await f.hooks.get('approval/request')(approvalRequest(other), async () => 'rejected'), 'rejected')
+  assert.deepEqual(await f.hooks.get('user-questions/request')(questionRequest(other), async () => safeAnswer()), safeAnswer())
+  assert.deepEqual((await f.worker.get(run.runId)).requests, [])
+})
+
+test('interaction publication failure and response checkpoint failure never strand or falsely resume a deferred', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId), put = f.store.put
+  f.store.put = async (_space, _key, value) => { if (value.requests?.length) throw new Error('journal unavailable'); return put(_space, _key, value) }
+  assert.equal(await f.hooks.get('approval/request')(approvalRequest(agent), () => assert.fail('no next')), 'unavailable')
+  assert.equal(f.worker.live.get(run.runId).interactions.size, 0)
+  assert.deepEqual((await f.worker.get(run.runId)).requests, [])
+  f.store.put = put
+  const waiting = interactionChange(f.worker, 1)
+  const answer = f.hooks.get('user-questions/request')(questionRequest(agent), () => assert.fail('no next'))
+  const [pending] = (await waiting).requests
+  f.store.put = async (_space, _key, value) => { if (value.responseReceipts) throw new Error('checkpoint unavailable'); return put(_space, _key, value) }
+  await assert.rejects(f.worker.respond(run.runId, pending.id, safeAnswer()), /checkpoint unavailable/)
+  assert.equal((await f.worker.get(run.runId)).requests.length, 1)
+  assert.equal(f.worker.live.get(run.runId).interactions.size, 1)
+  f.store.put = put
+  await f.worker.respond(run.runId, pending.id, safeAnswer())
+  assert.deepEqual(await answer, safeAnswer())
+  assert.equal(f.prompts.length, 1)
+})
+
+test('abort during response persistence cannot resume an approval even after its digest was written', async t => {
+  const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId), signal = new AbortController()
+  const waiting = interactionChange(f.worker, 1)
+  const original = f.hooks.get('approval/request')({ ...approvalRequest(agent), signal: signal.signal }, () => assert.fail('no next'))
+  const [pending] = (await waiting).requests
+  const entered = deferred(), release = deferred(), put = f.store.put
+  f.store.put = async (space, key, value) => {
+    if (value.responseReceipts?.[pending.id] && !value.responseReceipts[pending.id].expired) { entered.resolve(); await release.promise }
+    return put(space, key, value)
+  }
+  const reply = f.worker.respond(run.runId, pending.id, { outcome: 'allowed-once' }, { human: true })
+  const rejected = assert.rejects(reply, { code: 'REMOTE_REQUEST_EXPIRED' })
+  await entered.promise
+  signal.abort()
+  assert.equal(await original, 'cancelled')
+  release.resolve()
+  await rejected
+  await f.worker.tail
+  assert.equal(f.data.get(run.runId).responseReceipts[pending.id].expired, true)
+  await assert.rejects(f.worker.respond(run.runId, pending.id, { outcome: 'allowed-once' }, { human: true }), { code: 'REMOTE_REQUEST_EXPIRED' })
+  assert.deepEqual((await f.worker.get(run.runId)).requests, [])
 })

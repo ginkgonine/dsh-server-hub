@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import { MAX_INTERACTIONS, normalizeInteractions, serializeInteraction, validateInteractionResponse } from './interaction.js'
 
 const terminal = new Set(['completed', 'error', 'interrupted'])
 const OUTPUT_LIMIT = 32768
@@ -16,10 +17,13 @@ const deferred = () => {
   return { promise, resolve, reject }
 }
 const eventsOf = agent => [...(agent.session.ownEvents?.() || agent.session.snapshotEvents?.() || [])]
+const questionAborted = () => Object.assign(new Error('ask_user_question was aborted before the user answered'), { name: 'UserQuestionError', code: 'ASK_ABORTED' })
+const responseDigest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+const MAX_RESPONSE_RECEIPTS = 256
 
 /** One remote request owns one ordinary, independent worker conversation.
- * Ordinary routing is intentional: callers can open the real worker session to
- * answer its existing approvals. No fabricated parent/origin or shadow Agent.
+ * Its real interaction waterfalls are claimed by this worker and answered by
+ * the controlling human/Hub, never by a fabricated Agent or a new prompt.
  */
 export class RemoteWorker {
   constructor(ctx, store, { getConfig } = {}) {
@@ -37,12 +41,17 @@ export class RemoteWorker {
       const off = ctx.on(event, async (request, next) => {
         const entry = [...this.live.values()].find(value => value.agent === request.agent)
         if (!entry || !entry.active) return next()
-        entry.waits += 1
-        await this._waiting(entry, true)
-        try { return await next() } finally {
-          entry.waits -= 1
-          await this._waiting(entry, entry.waits > 0)
+        // Historical status-only fixtures have no native payload. Real requests
+        // (including malformed ones) never fall through to another answerer.
+        if (Reflect.ownKeys(request).length === 1 && Object.hasOwn(request, 'agent')) {
+          entry.waits += 1
+          await this._waiting(entry)
+          try { return await next() } finally {
+            entry.waits -= 1
+            await this._waiting(entry)
+          }
         }
+        return this._interaction(entry, event === 'approval/request' ? 'approval' : 'questions', request)
       }, { global: true, prepend: true })
       if (typeof off === 'function') this.disposers.push(off)
     }
@@ -57,7 +66,8 @@ export class RemoteWorker {
   initialize() {
     if (!this.initializing) this.initializing = this.serial(async () => {
       for (const record of await this.store.list('runs')) {
-        if (!terminal.has(record.state)) await this._write({ ...record, state: 'interrupted', stopReason: 'aborted', diagnostic: 'Worker restarted; this task will not be replayed' })
+        if (!terminal.has(record.state)) await this._write({ ...record, requests: [], state: 'interrupted', stopReason: 'aborted', diagnostic: 'Worker restarted; this task will not be replayed' })
+        else if (record.requests?.length) await this._write({ ...record, requests: [] })
       }
     })
     return this.initializing
@@ -67,6 +77,7 @@ export class RemoteWorker {
     if (!record) return undefined
     const { runId, sessionId, workspaceId, description, state, output, stopReason, diagnostic, createdAt, updatedAt } = record
     return copy({ runId, sessionId, workspaceId, description, state, createdAt, updatedAt,
+      revision: record.revision || 0, requests: normalizeInteractions(record.requests),
       ...(output === undefined ? {} : { output }), ...(stopReason === undefined ? {} : { stopReason }),
       ...(diagnostic === undefined ? {} : { diagnostic }),
       ...(record.cancelledBeforeStart ? { cancelledBeforeStart: true } : {}) })
@@ -113,7 +124,7 @@ export class RemoteWorker {
       // Durable intent precedes every session creation or model request. Restarts
       // reconcile this record; they never replay shell/model work.
       await this._write(record)
-      const entry = { runId, record, cwd: workspace.path, active: true, waits: 0, admitted: deferred(), done: deferred(), firstTurn: undefined }
+      const entry = { runId, record, cwd: workspace.path, active: true, waits: 0, interactions: new Map(), admitted: deferred(), done: deferred(), firstTurn: undefined }
       this.live.set(runId, entry)
       return { record, entry, fresh: true }
     })
@@ -122,7 +133,7 @@ export class RemoteWorker {
   }
 
   async _write(record) {
-    const updated = { ...record, updatedAt: Date.now() }
+    const updated = { ...record, revision: (record.revision || 0) + 1, updatedAt: Date.now() }
     await this.store.put('runs', record.runId, updated)
     this.events.emit('changed', record.runId)
     return updated
@@ -178,12 +189,113 @@ export class RemoteWorker {
     if (!await this.ctx.sessions.flush(session)) throw problem('REMOTE_STORAGE', 'Worker session durability checkpoint failed')
   }
 
-  async _waiting(entry, waiting) {
+  _interactionState(entry, requests) {
+    return entry.waits > 0 || requests.some(request => request.kind === 'approval') ? 'waiting_approval' :
+      requests.length ? 'waiting_input' : 'running'
+  }
+
+  async _waiting(entry) {
     await this.serial(async () => {
       const record = await this.store.get('runs', entry.runId)
       if (!record || terminal.has(record.state) || !entry.active) return
-      const state = waiting ? 'waiting_approval' : 'running'
-      if (record.state !== state) await this._write({ ...record, state })
+      const requests = normalizeInteractions([...entry.interactions.values()].map(pending => pending.wire))
+      const state = this._interactionState(entry, requests)
+      if (record.state !== state || JSON.stringify(record.requests || []) !== JSON.stringify(requests)) await this._write({ ...record, requests, state })
+    })
+  }
+
+  _releaseInteraction(entry, pending, value, error) {
+    if (pending.closed) return
+    pending.closed = true
+    entry.interactions.delete(pending.wire.id)
+    pending.signal?.removeEventListener('abort', pending.abort)
+    if (error) pending.answer.reject(error)
+    else pending.answer.resolve(value)
+  }
+
+  _withdrawInteraction(entry, pending) {
+    if (pending.closed) return
+    pending.expired = true
+    this._releaseInteraction(entry, pending, 'cancelled', pending.wire.kind === 'questions' ? questionAborted() : undefined)
+    // Wake the original tool immediately; durable projection removal follows
+    // the same serial journal as responses and terminal transitions.
+    void this.serial(async () => {
+      const record = await this.store.get('runs', entry.runId)
+      if (!record) return
+      const receipts = { ...(record.responseReceipts || {}) }
+      if (receipts[pending.wire.id]) receipts[pending.wire.id] = { ...receipts[pending.wire.id], expired: true }
+      const requests = normalizeInteractions([...entry.interactions.values()].map(item => item.wire))
+      await this._write({ ...record, responseReceipts: receipts, requests,
+        ...(terminal.has(record.state) ? {} : { state: this._interactionState(entry, requests) }) })
+    }).catch(() => {})
+  }
+
+  _cancelInteractions(entry) {
+    if (!entry) return
+    for (const pending of [...entry.interactions.values()]) this._withdrawInteraction(entry, pending)
+  }
+
+  async _interaction(entry, kind, request) {
+    if (request.signal?.aborted) {
+      if (kind === 'approval') return 'cancelled'
+      throw questionAborted()
+    }
+    let pending
+    try {
+      const wire = serializeInteraction(kind, request)
+      pending = { wire, signal: request.signal, answer: deferred(), closed: false, expired: false }
+      pending.abort = () => this._withdrawInteraction(entry, pending)
+      pending.signal?.addEventListener('abort', pending.abort, { once: true })
+      if (pending.signal?.aborted) pending.abort()
+      await this.serial(async () => {
+        const record = await this.store.get('runs', entry.runId)
+        if (pending.expired || !entry.active || this.closed || !record || terminal.has(record.state)) throw problem('REMOTE_REQUEST_EXPIRED', 'Interaction is no longer pending')
+        if (entry.interactions.size >= MAX_INTERACTIONS || Object.keys(record.responseReceipts || {}).length >= MAX_RESPONSE_RECEIPTS) throw problem('REMOTE_INPUT', 'Too many remote interactions')
+        const requests = normalizeInteractions([...entry.interactions.values()].map(item => item.wire).concat(wire))
+        entry.interactions.set(wire.id, pending)
+        await this._write({ ...record, requests, state: this._interactionState(entry, requests) })
+      })
+      return await pending.answer.promise
+    } catch (error) {
+      if (pending && !pending.closed) this._releaseInteraction(entry, pending, 'unavailable', kind === 'questions' ? error : undefined)
+      if (pending?.expired || request.signal?.aborted) {
+        if (kind === 'approval') return 'cancelled'
+        throw questionAborted()
+      }
+      if (kind === 'approval') return 'unavailable'
+      throw error
+    }
+  }
+
+  /** Resume exactly one original waterfall, never create or prompt an Agent. */
+  async respond(runId, requestId, input, { human = false } = {}) {
+    id(runId, 'runId'); id(requestId, 'requestId')
+    await this.initialize()
+    return this.serial(async () => {
+      let record = await this.store.get('runs', runId)
+      if (!record) throw problem('REMOTE_NOT_FOUND', 'Remote task does not exist')
+      const receipt = record.responseReceipts?.[requestId]
+      if (receipt) {
+        const native = validateInteractionResponse(receipt.interaction, input, { human })
+        if (receipt.expired) throw problem('REMOTE_REQUEST_EXPIRED', 'Interaction is no longer pending')
+        if (responseDigest(native) !== receipt.digest) throw problem('REMOTE_CONFLICT', 'Interaction already received a different response')
+        return this.public(record)
+      }
+      const entry = this.live.get(runId)
+      const pending = entry?.interactions.get(requestId)
+      if (this.closed || !entry?.active || terminal.has(record.state) || !pending || pending.closed || pending.signal?.aborted) throw problem('REMOTE_REQUEST_EXPIRED', 'Interaction is no longer pending')
+      const native = validateInteractionResponse(pending.wire, input, { human })
+      const requests = normalizeInteractions([...entry.interactions.values()].filter(item => item !== pending).map(item => item.wire))
+      record = await this._write({ ...record, requests, state: this._interactionState(entry, requests),
+        responseReceipts: { ...(record.responseReceipts || {}), [requestId]: { interaction: pending.wire, digest: responseDigest(native) } } })
+      // Cancellation can arrive while a durable checkpoint is in flight. A
+      // committed digest is not permission to resume an expired approval.
+      if (pending.expired || pending.signal?.aborted || this.closed || !entry.active) {
+        this._withdrawInteraction(entry, pending)
+        throw problem('REMOTE_REQUEST_EXPIRED', 'Interaction was cancelled before its response committed')
+      }
+      this._releaseInteraction(entry, pending, native)
+      return this.public(record)
     })
   }
 
@@ -225,9 +337,10 @@ export class RemoteWorker {
   }
 
   async _finish(entry, result) {
+    this._cancelInteractions(entry)
     return this.serial(async () => {
       let record = await this.store.get('runs', entry.runId)
-      if (!terminal.has(record.state)) record = await this._write({ ...record, ...result })
+      if (!terminal.has(record.state)) record = await this._write({ ...record, ...result, requests: [] })
       entry.active = false
       entry.admitted.resolve(record)
       entry.done.resolve(this.public(record))
@@ -261,6 +374,7 @@ export class RemoteWorker {
     await this.initialize()
     id(runId, 'runId')
     const entry = this.live.get(runId)
+    this._cancelInteractions(entry)
     let stop = false
     const result = await this.serial(async () => {
       let record = await this.store.get('runs', runId)
@@ -272,7 +386,7 @@ export class RemoteWorker {
       }
       if (!terminal.has(record.state)) {
         stop = true
-        record = await this._write({ ...record, state: 'interrupted', stopReason: 'aborted', output: [] })
+        record = await this._write({ ...record, requests: [], state: 'interrupted', stopReason: 'aborted', output: [] })
       }
       if (entry) {
         entry.active = false

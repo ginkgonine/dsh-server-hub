@@ -16,10 +16,11 @@ const overview = {
 const connection = { targetId: 'target-3081', endpoint: 'http://localhost:3081/', instanceId: 'worker', status: 'connected', workspaces: config.workspaces }
 const tick = () => new Promise(resolve => setImmediate(resolve))
 
-async function harness({ base = 'http://localhost:3080/', embedded = false, referrer = 'http://localhost:3080/', fetch: doFetch, initialConnections = [], names = {}, overviewData = overview } = {}) {
+async function harness({ base = 'http://localhost:3080/', embedded = false, referrer = 'http://localhost:3080/', fetch: doFetch, initialConnections = [], names = {}, overviewData = overview, manualPorts = [], hiddenPorts = [], confirm = true, storageWritable = true, activityRuns = [{ runId: 'r1', sessionId: 's1', state: 'running', description: 'Check CPU' }] } = {}) {
   let definition
   const listeners = new Map(), requests = [], disposers = [], slots = new Map(), effects = [], intervals = new Map()
   let intervalId = 0, removedStyle = false, savedConfig = structuredClone(config), savedConnections = structuredClone(initialConnections)
+  const confirmations = []
   const parent = { sent: [], postMessage(data, origin) { this.sent.push({ data, origin }) } }
   const win = {
     document: {
@@ -27,9 +28,16 @@ async function harness({ base = 'http://localhost:3080/', embedded = false, refe
       createElement: () => ({ dataset: {}, remove() { removedStyle = true } }), head: { appendChild() {} },
     },
     localStorage: {
-      getItem(key) { return key === 'dsh-server-hub.preferences.v1' ? JSON.stringify({ names, manualPorts: [] }) : null },
-      setItem(key, value) { if (key === 'dsh-server-hub.preferences.v1') names = JSON.parse(value).names },
+      getItem(key) { return key === 'dsh-server-hub.preferences.v1' ? JSON.stringify({ names, manualPorts, hiddenPorts }) : null },
+      setItem(key, value) {
+        if (!storageWritable) throw new Error('storage denied')
+        if (key === 'dsh-server-hub.preferences.v1') {
+          const saved = JSON.parse(value)
+          names = saved.names; manualPorts = saved.manualPorts || []; hiddenPorts = saved.hiddenPorts || []
+        }
+      },
     },
+    confirm(message) { confirmations.push(message); return typeof confirm === 'function' ? confirm(message) : confirm },
     addEventListener(type, callback) { listeners.set(type, callback) },
     removeEventListener(type, callback) { if (listeners.get(type) === callback) listeners.delete(type) },
     setInterval(callback) { intervals.set(++intervalId, callback); return intervalId },
@@ -48,7 +56,15 @@ async function harness({ base = 'http://localhost:3080/', embedded = false, refe
         savedConnections = [connected]
         value = { connection: connected }
       } else if (url.endsWith('/connections')) value = { connections: savedConnections }
-      else if (url.endsWith('/activity')) value = { runs: [{ runId: 'r1', sessionId: 's1', state: 'running', description: 'Check CPU' }] }
+      else if (url.endsWith('/activity')) value = { runs: activityRuns }
+      else if (url.endsWith('/response') && options.method === 'POST') {
+        const parts = url.split('/')
+        const run = activityRuns.find(run => run.runId === parts.at(-4))
+        const requestId = parts.at(-2)
+        run.requests = run.requests.filter(request => request.id !== requestId)
+        run.state = 'running'
+        value = { run }
+      }
       else if (options.method === 'PUT' && url.includes('/connections/')) {
         const input = JSON.parse(options.body)
         const saved = savedConnections.find(entry => entry.targetId === decodeURIComponent(url.split('/').at(-1)))
@@ -99,7 +115,8 @@ async function harness({ base = 'http://localhost:3080/', embedded = false, refe
   }
   function message(source, origin, type, extra = {}) { listeners.get('message')?.({ source, origin, data: { type, ...extra } }) }
   function cleanup() { for (const dispose of disposers.reverse()) dispose() }
-  return { client, win, parent, listeners, requests, slots, intervals, panel, modal, mountMonitor, message, cleanup, styleRemoved: () => removedStyle }
+  return { client, win, parent, listeners, requests, slots, intervals, panel, modal, mountMonitor, message, cleanup, confirmations,
+    preferences: () => structuredClone({ names, manualPorts, hiddenPorts }), styleRemoved: () => removedStyle }
 }
 function nodes(tree) {
   if (!tree || typeof tree !== 'object') return []
@@ -140,6 +157,112 @@ test('toolbar has one remote entry; local controller explains self instead of a 
   assert.equal(nodes(h.modal()).some(node => node.type === 'button' && /连接远程/.test(text(node))), false)
   assert.equal(nodes(h.modal()).filter(node => node.type === 'input').length, 1, 'main panel exposes reply mode only')
   assert.equal(nodes(h.modal()).find(node => node.type === 'h2').props.children[0], '远程管理')
+  h.cleanup()
+})
+
+test('remove hides named automatic/manual ports, keeps remote connections and restores via explicit add', async () => {
+  for (const source of ['auto', 'manual']) {
+    const h = await harness({ manualPorts: [3081], names: { '3081': '197服务器' },
+      initialConnections: [{ ...connection, name: '197服务器' }],
+      overviewData: { ...overview, instances: overview.instances.map(item => item.port === 3081 ? { ...item, source } : item) } })
+    await h.mountMonitor(); const { frames, children } = registerFrames(h)
+    assert.equal(button(h.panel(), '移除').props.disabled, true, 'controller cannot be removed')
+    button(h.panel(), '移除').props.onClick()
+    assert.equal(h.confirmations.length, 0)
+    selectWorker(h)
+    assert.equal(button(h.panel(), '移除').props.disabled, false)
+    button(h.panel(), '移除').props.onClick()
+    assert.match(h.confirmations[0], /不会停止实例、断开远控连接或终止任务/)
+    assert.deepEqual(h.preferences().hiddenPorts, [3081])
+    assert.deepEqual(h.preferences().manualPorts, [])
+    assert.equal(h.preferences().names['3081'], '197服务器')
+    assert.equal(nodes(h.panel()).some(node => node.props?.['data-dsh-hub-port'] === 3081), false)
+    assert.match(instanceTab(h, 3080).props.className, /is-active/)
+    assert.equal(nodes(h.panel()).filter(node => node.type === 'iframe').length, 1)
+    const notice = text(h.panel())
+    h.message(children[1], 'http://localhost:3081', SAVED)
+    assert.equal(text(h.panel()), notice, 'removed iframe is no longer a trusted settings source')
+    frames[1].props.onLoad()
+    await button(h.panel(), '↻').props.onClick()
+    assert.equal(nodes(h.panel()).some(node => node.props?.['data-dsh-hub-port'] === 3081), false)
+    assert.ok(h.requests.every(request => request.options.method === 'GET'), 'removal must not mutate remote grants or tasks')
+    await button(h.panel(), '远程管理').props.onClick()
+    assert.match(text(h.modal()), /197服务器/, 'saved remote connection is preserved')
+    button(h.modal(), '关闭').props.onClick()
+    const input = nodes(h.panel()).find(node => node.type === 'input' && node.props.placeholder === '端口')
+    input.props.onChange({ target: { value: '3081' } })
+    button(h.panel(), '+').props.onClick()
+    await tick()
+    assert.deepEqual(h.preferences().hiddenPorts, [])
+    assert.deepEqual(h.preferences().manualPorts, [3081])
+    assert.match(text(instanceTab(h, 3081)), /197服务器/)
+    h.cleanup()
+  }
+})
+
+test('hidden ports persist after reload and renaming or adding another port does not erase them', async () => {
+  const h = await harness({ names: { '3081': '保留名称' }, manualPorts: [3081] })
+  await h.mountMonitor(); registerFrames(h); selectWorker(h)
+  button(h.panel(), '移除').props.onClick()
+  await tick()
+  const saved = h.preferences()
+  h.cleanup()
+  const reloaded = await harness(saved)
+  await reloaded.mountMonitor()
+  assert.equal(nodes(reloaded.panel()).some(node => node.props?.['data-dsh-hub-port'] === 3081), false)
+  button(reloaded.panel(), '命名').props.onClick()
+  nodes(reloaded.panel()).find(node => node.type === 'input' && node.props.className?.includes('dsh-hub-name-input')).props.onChange({ target: { value: '本机' } })
+  await button(reloaded.panel(), '✓').props.onClick()
+  assert.deepEqual(reloaded.preferences().hiddenPorts, [3081])
+  nodes(reloaded.panel()).find(node => node.type === 'input' && node.props.placeholder === '端口').props.onChange({ target: { value: '3099' } })
+  button(reloaded.panel(), '+').props.onClick()
+  await tick()
+  assert.deepEqual(reloaded.preferences().hiddenPorts, [3081])
+  reloaded.cleanup()
+})
+
+test('canceling removal leaves ports and preferences unchanged', async () => {
+  const h = await harness({ confirm: false, manualPorts: [3081] })
+  await h.mountMonitor(); registerFrames(h); selectWorker(h)
+  const saved = h.preferences(), reads = h.requests.length
+  button(h.panel(), '移除').props.onClick()
+  assert.equal(h.confirmations.length, 1)
+  assert.deepEqual(h.preferences(), saved)
+  assert.ok(instanceTab(h, 3081))
+  assert.equal(h.requests.length, reads)
+  h.cleanup()
+})
+
+test('a late scan cannot resurrect a removed port and main stays visible even in old hidden preferences', async () => {
+  let finish, scans = 0
+  const h = await harness({ fetch: async url => {
+    if (url.includes('/overview') && ++scans === 2) return new Promise(resolve => { finish = resolve })
+    return { ok: true, json: async () => url.includes('/overview') ? overview : { connections: [] } }
+  } })
+  await h.mountMonitor(); registerFrames(h); selectWorker(h)
+  for (const callback of h.intervals.values()) callback()
+  await tick()
+  assert.ok(finish)
+  button(h.panel(), '移除').props.onClick()
+  finish({ ok: true, json: async () => overview })
+  await tick()
+  assert.equal(nodes(h.panel()).some(node => node.props?.['data-dsh-hub-port'] === 3081), false)
+  assert.match(instanceTab(h, 3080).props.className, /is-active/)
+  h.cleanup()
+  const legacy = await harness({ hiddenPorts: [3080, '3081', -1, 99999, 'bad'] })
+  await legacy.mountMonitor()
+  assert.ok(instanceTab(legacy, 3080))
+  assert.equal(nodes(legacy.panel()).some(node => node.props?.['data-dsh-hub-port'] === 3081), false)
+  legacy.cleanup()
+})
+
+test('storage failure still removes for this page and warns persistence is unavailable', async () => {
+  const h = await harness({ storageWritable: false })
+  await h.mountMonitor(); registerFrames(h); selectWorker(h)
+  button(h.panel(), '移除').props.onClick()
+  await button(h.panel(), '↻').props.onClick()
+  assert.equal(nodes(h.panel()).some(node => node.props?.['data-dsh-hub-port'] === 3081), false)
+  assert.match(text(h.panel()), /浏览器未能保存，刷新后可能恢复/)
   h.cleanup()
 })
 
@@ -465,16 +588,95 @@ test('connect is explicit same-origin POST; shows connected rather than disabled
   h.cleanup()
 })
 
-test('listing is once per open/refresh with no remote polling and no model/session side effects', async () => {
+test('only an open management panel refreshes pending interactions without model/session side effects', async () => {
   const h = await harness()
   await button(h.panel(), '远程管理').props.onClick()
   assert.deepEqual(h.requests.map(request => request.url), ['api/dsh-server-hub/remote/config', 'api/dsh-server-hub/remote/connections', 'api/dsh-server-hub/remote/activity'])
   assert.match(text(h.modal()), /Check CPU · running/)
-  assert.equal(h.intervals.size, 0)
+  assert.equal(h.intervals.size, 1)
   await tick(); assert.equal(h.requests.length, 3)
   await button(h.modal(), '刷新').props.onClick()
   assert.equal(h.requests.length, 6)
   assert.ok(h.requests.every(request => request.options.method === 'GET'))
+  const poll = [...h.intervals.values()][0]
+  await poll(); await tick()
+  assert.equal(h.requests.at(-1).url, 'api/dsh-server-hub/remote/activity')
+  button(h.modal(), '关闭').props.onClick()
+  assert.equal(h.intervals.size, 0)
+  const count = h.requests.length
+  await poll(); await tick()
+  assert.equal(h.requests.length, count, 'a stale timer must not refresh a closed modal')
+  h.cleanup()
+})
+
+const pendingQuestion = () => ({ id: 'request-q1', kind: 'questions', requiresHuman: false, createdAt: 1,
+  questions: [{ id: 'mode', question: '选择检查范围', options: [{ label: '只读', description: '不修改数据' }, { label: '完整' }] }] })
+const pendingApproval = () => ({ id: 'request-a1', kind: 'approval', requiresHuman: true, createdAt: 1,
+  toolName: 'bash', reason: 'Allow GPU device access?', displayReason: { en: 'Allow GPU device access?', 'zh-CN': '允许查询显卡设备？' } })
+
+test('pending questions are visible outside folded history and human answers resume the owned delegated run', async () => {
+  const run = { runId: 'r1', description: '检查GPU', scope: 'controller', state: 'waiting_input', requests: [pendingQuestion()] }
+  const h = await harness({ activityRuns: [run] })
+  await button(h.panel(), '远程管理').props.onClick()
+  assert.match(text(h.modal()), /检查GPU · 等待回复/)
+  assert.equal(button(h.modal(), '提交回复').props.disabled, true)
+  const option = nodes(h.modal()).find(node => node.type === 'input' && node.props.type === 'radio')
+  option.props.onChange({ target: { checked: true } })
+  await button(h.modal(), '提交回复').props.onClick()
+  const post = h.requests.find(request => request.options.method === 'POST')
+  assert.equal(post.url, 'api/dsh-server-hub/remote/delegated/r1/requests/request-q1/response')
+  assert.deepEqual(JSON.parse(post.options.body), { response: { answers: [{ id: 'mode', selected: ['只读'] }] } })
+  assert.doesNotMatch(text(h.modal()), /等待回复/)
+  assert.match(text(h.modal()), /原远程任务继续执行/)
+  h.cleanup()
+})
+
+test('custom question answers clear a single selection, and pending request withdrawal removes stale form', async () => {
+  const run = { runId: 'r1', scope: 'controller', state: 'waiting_input', requests: [pendingQuestion()] }
+  const h = await harness({ activityRuns: [run] })
+  await button(h.panel(), '远程管理').props.onClick()
+  nodes(h.modal()).find(node => node.type === 'input' && node.props.type === 'radio').props.onChange({ target: { checked: true } })
+  nodes(h.modal()).find(node => node.type === 'textarea').props.onChange({ target: { value: '只检查进程' } })
+  assert.equal(nodes(h.modal()).find(node => node.type === 'input' && node.props.type === 'radio').props.checked, false)
+  await button(h.modal(), '提交回复').props.onClick()
+  assert.deepEqual(JSON.parse(h.requests.find(request => request.options.method === 'POST').options.body).response,
+    { answers: [{ id: 'mode', selected: [], custom: '只检查进程' }] })
+  run.requests = [pendingQuestion()]
+  await [...h.intervals.values()][0](); await tick()
+  assert.equal(nodes(h.modal()).find(node => node.type === 'textarea').props.value, '')
+  run.requests = []; run.state = 'interrupted'
+  await [...h.intervals.values()][0](); await tick()
+  assert.equal(nodes(h.modal()).some(node => node.type === 'textarea'), false)
+  h.cleanup()
+})
+
+test('approval needs an explicit confirmed human click and worker scope posts only to its local request', async () => {
+  for (const confirm of [false, true]) {
+    const h = await harness({ confirm, activityRuns: [{ runId: 'r2', description: '显卡巡检', scope: 'worker', state: 'waiting_approval', requests: [pendingApproval()] }] })
+    await button(h.panel(), '远程管理').props.onClick()
+    assert.match(text(h.modal()), /允许查询显卡设备/)
+    assert.match(text(h.modal()), /主控 Agent 不能代批/)
+    await button(h.modal(), '允许一次').props.onClick()
+    const posts = h.requests.filter(request => request.options.method === 'POST')
+    assert.equal(posts.length, confirm ? 1 : 0)
+    if (confirm) {
+      assert.equal(posts[0].url, 'api/dsh-server-hub/remote/runs/r2/requests/request-a1/response')
+      assert.deepEqual(JSON.parse(posts[0].options.body), { response: { outcome: 'allowed-once' }, human: true })
+    }
+    assert.equal(h.confirmations.length, 1)
+    h.cleanup()
+  }
+})
+
+test('failed interaction response is not replayed and leaves its pending form available for inspection', async () => {
+  const h = await harness({ fetch: async (url, options) => ({ ok: options.method !== 'POST', status: options.method === 'POST' ? 400 : 200,
+    json: async () => url.endsWith('/activity') ? { runs: [{ runId: 'r1', scope: 'controller', state: 'waiting_approval', requests: [pendingApproval()] }] } : url.endsWith('/connections') ? { connections: [] } : config }) })
+  await button(h.panel(), '远程管理').props.onClick()
+  await button(h.modal(), '拒绝').props.onClick()
+  assert.match(text(h.modal()), /不会自动重发/)
+  assert.match(text(h.modal()), /等待人工审批/)
+  await tick()
+  assert.equal(h.requests.filter(request => request.options.method === 'POST').length, 1)
   h.cleanup()
 })
 

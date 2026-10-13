@@ -7,4 +7,4 @@
     # DSH 0.2 remote Agent service. Execution stays off until workspace opt-in in the UI.
     - id: dsh-server-hub-remote
       name: dsh-server-hub/remote
-      inject: [webServer, connection, storage, storage.backend.json, credentials, workspaceRegistry, sessionController, sessions, tools, subagents]
+      inject: [webServer, connection, storage, storage.backend.json, credentials, workspaceRegistry, sessionController, sessions, tools, subagents, agents, userQuestions, approval]

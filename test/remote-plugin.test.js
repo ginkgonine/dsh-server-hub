@@ -10,7 +10,7 @@ import { RemoteStore } from '../src/remote/store.js'
 test('Cordis injection metadata names services directly, not required/optional pseudo-services', () => {
   assert.ok(Array.isArray(inject))
   assert.deepEqual(inject, ['webServer', 'connection', 'storage', 'storage.backend.json', 'credentials',
-    'workspaceRegistry', 'sessionController', 'sessions', 'tools', 'subagents'])
+    'workspaceRegistry', 'sessionController', 'sessions', 'tools', 'subagents', 'agents', 'userQuestions', 'approval'])
 })
 
 test('published entry and bundle retain the same direct service dependencies', async () => {
@@ -44,7 +44,12 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
   let cookie = nativeCookie(port)
   const workspace = { id: 'system', title: 'Server maintenance', path: '/project/system' }
   sessions.set('parent-1', { header: { id: 'parent-1', cwd: '/project/main' } })
+  const parent = { id: 'parent-1', session: sessions.get('parent-1'), status: 'running' }
   const ctx = {
+    get(name) { return ctx[name] },
+    agents: { get: id => id === parent.id ? parent : agents.get(id), roots: () => [parent] },
+    userQuestions: { ask: async request => { notices.emit('native-question', request); throw new Error('No question answerer') } },
+    approval: { request: async request => { notices.emit('native-approval', request); return 'unavailable' } },
     effect(callback) { const dispose = callback(); effects.push(dispose); return dispose },
     provide(name, value) { ctx[name] = value },
     on(name, hook) { hooks.set(name, hook); return () => hooks.delete(name) },
@@ -140,7 +145,7 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
       { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
     agent.status = 'idle'; agent.idle.resolve()
   }
-  return { ctx, runtime, tools, providers, cookie, endpoint, request, finish, prompts, notices, creates, credentials, agents, units }
+  return { ctx, runtime, tools, providers, cookie, endpoint, request, finish, prompts, notices, creates, credentials, agents, units, parent, hooks }
 }
 
 test('actual Cordis activates routes/tools and removes them on disposal', { skip: !process.env.DSH_TEST_CORDIS }, async t => {
@@ -151,7 +156,7 @@ test('actual Cordis activates routes/tools and removes them on disposal', { skip
     assert.equal((await f.request('/config')).status, 200)
     assert.equal((await f.request('/connections')).status, 200)
     assert.equal((await f.request('/activity')).status, 200)
-    assert.equal(f.tools.size, 4)
+    assert.equal(f.tools.size, 5)
     assert.equal(f.providers.size, 1)
     await f.runtime.dispose()
     assert.equal((await f.request('/config')).status, 404)
@@ -216,7 +221,7 @@ test('remote execution starts off; config exposes registered workspaces, never a
 
 test('every route including SSE and config mutations requires native DSH admission', async t => {
   const f = await fixture(t)
-  for (const [path, method, input] of [['/catalog', 'GET'], ['/config', 'PUT', { enabled: true, workspaceIds: ['system'] }], ['/config', 'PUT', { waitForResult: true }], ['/connections/remote-0123456789abcdef01234567', 'PUT', { name: '197服务器' }], ['/runs/r1/events', 'GET'], ['/connections', 'POST', { endpoint: f.endpoint }]]) {
+  for (const [path, method, input] of [['/catalog', 'GET'], ['/config', 'PUT', { enabled: true, workspaceIds: ['system'] }], ['/config', 'PUT', { waitForResult: true }], ['/connections/remote-0123456789abcdef01234567', 'PUT', { name: '197服务器' }], ['/runs/r1/events', 'GET'], ['/runs/r1/requests/request-q1/response', 'POST', { response: { answers: [] }, human: true }], ['/delegated/r1/requests/request-q1/response', 'POST', { response: { outcome: 'allowed-once' } }], ['/connections', 'POST', { endpoint: f.endpoint }]]) {
     assert.equal((await f.request(path, { method, input, cookies: '' })).status, 401)
     assert.equal((await f.request(path, { method, input, origin: 'https://untrusted.example' })).status, 403)
   }
@@ -335,6 +340,95 @@ test('name updates need only main admission and are visible to target lookup wit
   assert.equal(main.creates.length, 0)
   assert.equal(worker.creates.length, 0)
   assert.equal(JSON.stringify(rename.value).includes('v1.a.b'), false)
+})
+
+const questionPayload = () => ({ questions: [{ id: 'scope', question: '选择检查范围', options: [{ label: 'GPU进程' }, { label: '全部' }] }] })
+const questionAnswer = () => ({ answers: [{ id: 'scope', selected: ['GPU进程'] }] })
+async function controllerState(controller, runId, state) {
+  if ((await controller.status(runId, 'parent-1')).state === state) return controller.status(runId, 'parent-1')
+  return bounded(new Promise(resolve => {
+    const changed = async id => {
+      if (id !== runId) return
+      const value = await controller.status(runId, 'parent-1')
+      if (value.state === state) { controller.events.off('changed', changed); resolve(value) }
+    }
+    controller.events.on('changed', changed)
+    void changed(runId)
+  }))
+}
+
+test('background questions cross real HTTP/SSE and ordinary reply resumes one original worker waterfall', async t => {
+  const { main, worker, connection } = await connected(t)
+  const exec = { agent: main.parent, callId: 'question-background', signal: new AbortController().signal }
+  const submit = await main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: '检查GPU', prompt: 'inspect GPU' }, exec)
+  const agent = worker.agents.get(worker.creates[0].sessionId)
+  const notice = once(main.notices, 'report')
+  const original = worker.hooks.get('user-questions/request')({ agent, ...questionPayload(), signal: new AbortController().signal }, () => assert.fail('worker must own the question'))
+  const status = await controllerState(main.runtime.controller, submit.runId, 'waiting_input')
+  const [notification] = await bounded(notice)
+  assert.match(notification.content[0].text, /选择检查范围/)
+  assert.ok(notification.requestId.includes(status.requests[0].id))
+  await assert.rejects(main.tools.get('remote_agent_respond').execute({ runId: submit.runId, requestId: status.requests[0].id, ...questionAnswer() }, { agent: { id: 'another' } }), /belong/)
+  const response = await main.tools.get('remote_agent_respond').execute({ runId: submit.runId, requestId: status.requests[0].id, ...questionAnswer() }, exec)
+  assert.equal(response.state, 'running')
+  assert.deepEqual(await bounded(original), questionAnswer())
+  assert.equal(worker.creates.length, 1)
+  assert.equal(worker.prompts.length, 1)
+  const final = once(main.notices, 'report')
+  worker.finish(agent.id, 'GPU inspected')
+  await bounded(final)
+  assert.equal(main.prompts.length, 2, 'one request notification and one final result')
+  const publicStatus = await main.runtime.controller.status(submit.runId, main.parent.id)
+  for (const key of ['prompt', 'originSessionId', 'responseReceipts', 'interactionNotifications']) assert.equal(key in publicStatus, false)
+})
+
+test('background approvals never grant via model tool; authenticated Hub human reply continues the same task', async t => {
+  const { main, worker, connection } = await connected(t)
+  const exec = { agent: main.parent, callId: 'approval-background', signal: new AbortController().signal }
+  const submit = await main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: '显卡权限', prompt: 'inspect GPU' }, exec)
+  const agent = worker.agents.get(worker.creates[0].sessionId)
+  const original = worker.hooks.get('approval/request')({ agent, toolName: 'bash', callId: 'gpu-call', reason: 'Query GPU devices', signal: new AbortController().signal }, () => assert.fail('worker must own approval'))
+  const status = await controllerState(main.runtime.controller, submit.runId, 'waiting_approval')
+  const requestId = status.requests[0].id
+  await assert.rejects(main.tools.get('remote_agent_respond').execute({ runId: submit.runId, requestId, answers: [], human: true }, exec), { code: 'REMOTE_HUMAN_REQUIRED' })
+  const path = `/delegated/${submit.runId}/requests/${requestId}/response`
+  assert.equal((await main.request(path, { method: 'POST', input: { response: { outcome: 'allowed-once' }, targetId: connection.targetId } })).status, 400)
+  const response = await main.request(path, { method: 'POST', input: { response: { outcome: 'allowed-once' } } })
+  assert.equal(response.status, 200)
+  assert.equal(await bounded(original), 'allowed-once')
+  assert.equal(worker.creates.length, 1)
+  assert.equal(worker.prompts.length, 1)
+  const again = await main.request(path, { method: 'POST', input: { response: { outcome: 'allowed-once' } } })
+  assert.ok([200, 400].includes(again.status), 'duplicate response can deduplicate or be stale, never new work')
+  worker.finish(agent.id)
+  await controllerState(main.runtime.controller, submit.runId, 'completed')
+})
+
+test('foreground questions and approvals reach parent native answerers and finish in one waiting tool call', async t => {
+  for (const kind of ['questions', 'approval']) {
+    const { main, worker, connection } = await connected(t)
+    await main.request('/config', { method: 'PUT', input: { waitForResult: true } })
+    const native = deferred()
+    const answer = deferred()
+    main.ctx.userQuestions.ask = async request => { native.resolve(request); return answer.promise }
+    main.ctx.approval.request = async request => { native.resolve(request); return answer.promise }
+    const started = once(worker.notices, 'worker-prompt')
+    const result = main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: '交互巡检', prompt: 'inspect', run_in_background: true },
+      { agent: main.parent, callId: `native-${kind}`, signal: new AbortController().signal })
+    await bounded(started)
+    const agent = worker.agents.get(worker.creates[0].sessionId)
+    const original = worker.hooks.get(kind === 'questions' ? 'user-questions/request' : 'approval/request')({ agent, signal: new AbortController().signal,
+      ...(kind === 'questions' ? questionPayload() : { toolName: 'bash', reason: 'GPU query' }) }, () => assert.fail('must capture'))
+    const request = await bounded(native.promise)
+    assert.equal(request.agent, main.parent, 'native waterfall borrows exact original parent, not fabricated Agent')
+    if (kind === 'questions') { assert.equal(request.questions[0].question, '选择检查范围'); answer.resolve(questionAnswer()) }
+    else { assert.equal(request.toolName, 'bash'); answer.resolve('allowed-once') }
+    assert.deepEqual(await bounded(original), kind === 'questions' ? questionAnswer() : 'allowed-once')
+    worker.finish(agent.id)
+    assert.equal((await bounded(result)).stopReason, 'completed')
+    assert.equal(main.prompts.length, 0, 'native interactions must not create second parent turn')
+    assert.equal(worker.prompts.length, 1)
+  }
 })
 
 test('same task identity deduplicates at both ends; revoked workspace cannot start new work', async t => {

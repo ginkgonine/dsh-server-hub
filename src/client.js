@@ -57,6 +57,7 @@ window.__ModuleLoader__.load({
       .dsh-hub-action:hover { background: color-mix(in srgb, currentColor 6%, transparent); }
       .dsh-hub-action:disabled { cursor: default; opacity: .42; }
       .dsh-hub-action.is-enabled { border-color: color-mix(in srgb, #39b66a 55%, transparent); color: #39b66a; }
+      .dsh-hub-action.is-remove:not(:disabled):hover { border-color: #d96464; color: #d96464; }
       .dsh-hub-status { flex: 0 1 190px; min-width: 0; max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; opacity: .62; }
       .dsh-hub-stage { position: relative; min-width: 0; min-height: 0; overflow: hidden; isolation: isolate; background: var(--dsw-alias-bg-base, Canvas); }
       .dsh-hub-frame { position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%; border: 0; display: block; opacity: 0; pointer-events: none; background: var(--dsw-alias-bg-base, Canvas); color-scheme: inherit; transform: translateZ(0); will-change: opacity; transition: opacity 160ms cubic-bezier(.2, .7, .2, 1); }
@@ -85,10 +86,13 @@ window.__ModuleLoader__.load({
     `
 
     function defaultPreferences() {
-      return { names: {}, manualPorts: [] }
+      return { names: {}, manualPorts: [], hiddenPorts: [] }
     }
 
+    let volatilePreferences = null
+
     function readPreferences() {
+      if (volatilePreferences) return volatilePreferences
       try {
         const parsed = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || 'null')
         if (!parsed || typeof parsed !== 'object') return defaultPreferences()
@@ -96,7 +100,10 @@ window.__ModuleLoader__.load({
         const manualPorts = Array.isArray(parsed.manualPorts)
           ? [...new Set(parsed.manualPorts.map(Number).filter((port) => Number.isInteger(port) && port > 0 && port <= 65535))]
           : []
-        return { names, manualPorts }
+        const hiddenPorts = Array.isArray(parsed.hiddenPorts)
+          ? [...new Set(parsed.hiddenPorts.map(Number).filter((port) => Number.isInteger(port) && port > 0 && port <= 65535))]
+          : []
+        return { names, manualPorts, hiddenPorts }
       } catch {
         return defaultPreferences()
       }
@@ -105,12 +112,17 @@ window.__ModuleLoader__.load({
     let requestOverviewRefresh = async () => {}
 
     function storePreferences(value) {
+      let persisted = false
       try {
         window.localStorage.setItem(STORAGE_KEY, JSON.stringify(value))
+        volatilePreferences = null
+        persisted = true
       } catch {
-        // The Hub remains usable when browser storage is unavailable.
+        // Apply changes for this page even if browser storage is unavailable.
+        volatilePreferences = value
       }
       void requestOverviewRefresh(true)
+      return persisted
     }
 
     function loopbackHostname(hostname) {
@@ -145,6 +157,7 @@ window.__ModuleLoader__.load({
       const page = documentURL()
       const url = instanceURL(port, page && loopbackHostname(page.hostname) ? page.hostname : parsed.hostname)
       const source = item.source === 'manual' ? 'manual' : item.source === 'local' ? 'local' : 'auto'
+      if (source !== 'local' && preferences.hiddenPorts.includes(port)) return null
       const connection = source === 'local' ? null : connectionForInstance({ url, originalUrl })
       const cachedLabel = preferences.names[url] || preferences.names[originalUrl] || preferences.names[String(port)] || ''
       const customLabel = connection && typeof connection.name === 'string' ? connection.name : typeof cachedLabel === 'string' ? cachedLabel : ''
@@ -381,8 +394,11 @@ window.__ModuleLoader__.load({
             if (!response.ok) throw new Error(`HTTP ${response.status}`)
             const result = await response.json()
             if (disposed) return
+            // Use current preferences after the fetch: a late scan must not
+            // resurrect a port the user removed while this request was running.
+            const currentPreferences = readPreferences()
             const instances = Array.isArray(result.instances)
-              ? result.instances.map((item) => validInstance(item, preferences)).filter((item) => item !== null)
+              ? result.instances.map((item) => validInstance(item, currentPreferences)).filter((item) => item !== null)
               : []
             const reconciled = reconcileStates(instances, result.states)
             const activeId = hubSnapshot.activeId && instances.some((item) => item.id === hubSnapshot.activeId)
@@ -422,6 +438,7 @@ window.__ModuleLoader__.load({
         if (remoteControlAvailable()) void loadRemoteConnections().catch(() => {})
         requestOverviewRefresh = refresh
         notificationOpen = (id) => {
+          if (!hubSnapshot.instances.some(item => item.id === id)) return
           setActiveServer(id)
           props.layout.selectPanel(PANEL_ID)
         }
@@ -468,11 +485,120 @@ window.__ModuleLoader__.load({
       REMOTE_INSTANCE_CHANGED: '远程实例已改变，请先断开旧连接，再确认接入。',
       REMOTE_STORAGE: '主控无法保存连接信息，请检查 DSH 私有凭据存储是否可写。',
       REMOTE_NAME: '名称需为不超过 40 个字符的文本，不能包含控制字符。',
+      REMOTE_REQUEST_EXPIRED: '此请求已撤回、取消或结束，请刷新查看最新状态。',
+      REMOTE_HUMAN_REQUIRED: '此请求需要你亲自回复，Agent 不能代为审批。',
+      REMOTE_CONFLICT: '此请求已经收到不同回复，请刷新确认，勿重复提交。',
+      REMOTE_INPUT: '回复格式无效，请完成每个问题并核对可选项。',
+      REMOTE_NOT_FOUND: '原任务不存在，请刷新确认；不会重新派单。',
       REMOTE_CONNECTION_INVALID: '旧连接信息无效，请断开后重新接入。',
       REMOTE_CONNECTION_MISSING: '该远程尚未接入，请先接入主控。',
       REMOTE_TRANSPORT: '主控无法访问远程，请检查端口或隧道是否可达，再手动重试。',
     }
     let remoteEpoch = 0
+    let interactionTimer = null
+    let refreshingInteractions = false
+    const interactionKey = (run, request) => `${run.scope || 'controller'}:${run.runId}:${request.id}`
+    let interactionDrafts = {}
+    let respondingInteraction = null
+
+    function stopInteractionRefresh() {
+      if (interactionTimer !== null) window.clearInterval(interactionTimer)
+      interactionTimer = null
+    }
+
+    async function refreshInteractions(epoch) {
+      if (refreshingInteractions || epoch !== remoteEpoch || remoteSnapshot.kind !== 'manager') return
+      refreshingInteractions = true
+      try {
+        const activity = await remoteRequest('/activity')
+        if (epoch === remoteEpoch && Array.isArray(activity.runs)) {
+          const live = new Set(activity.runs.flatMap(run => (run.requests || []).map(request => interactionKey(run, request))))
+          interactionDrafts = Object.fromEntries(Object.entries(interactionDrafts).filter(([key]) => live.has(key)))
+          publishRemote({ runs: activity.runs })
+        }
+      } catch (error) {
+        if (epoch === remoteEpoch) publishRemote({ error: remoteError(error) })
+      } finally { refreshingInteractions = false }
+    }
+
+    function startInteractionRefresh(epoch) {
+      stopInteractionRefresh()
+      // Only the open management panel refreshes; no model/status polling loop.
+      interactionTimer = window.setInterval(() => { void refreshInteractions(epoch) }, 3000)
+    }
+
+    function editInteractionAnswer(run, request, question, patch) {
+      const key = interactionKey(run, request)
+      const draft = interactionDrafts[key] || {}
+      interactionDrafts = { ...interactionDrafts, [key]: { ...draft, [question.id]: { selected: [], custom: '', ...(Object.hasOwn(draft, question.id) ? draft[question.id] : undefined), ...patch } } }
+      publishRemote({})
+    }
+
+    async function sendInteractionResponse(run, request, response) {
+      if (respondingInteraction) return
+      if ((response.outcome === 'allowed-once' || request.questions?.some(question => question.intent && response.answers?.some(answer => answer.id === question.id && answer.selected.includes(question.intent.approve)))) &&
+          !window.confirm(`确认允许远程任务「${run.description || run.runId}」继续？请核对显示的审批原因／计划；此操作不会永久放开权限。`)) return
+      const key = interactionKey(run, request), epoch = remoteEpoch
+      respondingInteraction = key
+      publishRemote({ error: null })
+      try {
+        const scope = run.scope === 'worker' ? 'runs' : 'delegated'
+        await remoteRequest(`/${scope}/${encodeURIComponent(run.runId)}/requests/${encodeURIComponent(request.id)}/response`, {
+          method: 'POST', body: { response, ...(scope === 'runs' ? { human: true } : {}) },
+        })
+        if (epoch === remoteEpoch) {
+          delete interactionDrafts[key]
+          publishRemote({ notice: '回复已提交，原远程任务继续执行。' })
+          await refreshInteractions(epoch)
+        }
+      } catch (error) {
+        if (epoch === remoteEpoch) publishRemote({ error: `${remoteError(error)}；不会自动重发，请刷新确认原任务状态。` })
+      } finally {
+        respondingInteraction = null
+        if (epoch === remoteEpoch) publishRemote({})
+      }
+    }
+
+    function interactionCard(run, request, snapshot) {
+      const connection = snapshot.connections.find(item => item.targetId === run.targetId)
+      const key = interactionKey(run, request)
+      const disabled = Boolean(respondingInteraction) || snapshot.loading
+      const draft = interactionDrafts[key] || {}
+      const answers = (request.questions || []).map(question => {
+        const value = (Object.hasOwn(draft, question.id) ? draft[question.id] : undefined) || { selected: [], custom: '' }
+        return { id: question.id, selected: value.selected, ...(value.custom.trim() ? { custom: value.custom } : {}) }
+      })
+      const complete = answers.every(answer => answer.selected.length || answer.custom?.trim())
+      return React.createElement('article', { key, className: 'dsh-hub-remote-target' },
+        React.createElement('strong', null, run.description || run.runId, request.kind === 'approval' ? ' · 等待人工审批' : ' · 等待回复'),
+        React.createElement('small', { style: { display: 'block' } }, connection ? `${connection.name || '远程'} · ${connection.endpoint}` : run.scope === 'worker' ? '本机接收的远程任务' : run.targetId || '远程任务'),
+        React.createElement('small', { style: { display: 'block' } }, run.runId),
+        request.kind === 'approval' ? React.createElement('div', null,
+          React.createElement('p', null, `工具：${request.toolName}`),
+          React.createElement('p', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, request.displayReason?.['zh-CN'] || request.displayReason?.en || request.reason || '远程请求执行权限'),
+          React.createElement('p', { className: 'dsh-hub-remote-description' }, '审批只能由你处理，主控 Agent 不能代批。'),
+          React.createElement('button', { type: 'button', className: 'dsh-hub-action', disabled, onClick: () => sendInteractionResponse(run, request, { outcome: 'allowed-once' }) }, '允许一次'),
+          React.createElement('button', { type: 'button', className: 'dsh-hub-action', disabled, onClick: () => sendInteractionResponse(run, request, { outcome: 'rejected' }) }, '拒绝'),
+        ) : React.createElement('div', null,
+          (request.questions || []).map(question => {
+            const value = (Object.hasOwn(draft, question.id) ? draft[question.id] : undefined) || { selected: [], custom: '' }
+            return React.createElement('fieldset', { key: question.id, disabled },
+              React.createElement('legend', null, question.header || question.question),
+              question.header ? React.createElement('p', null, question.question) : null,
+              question.detail ? React.createElement('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, question.detail) : null,
+              (question.options || []).map(option => React.createElement('label', { key: option.label, className: 'dsh-hub-remote-workspace' },
+                React.createElement('input', { type: question.multiSelect ? 'checkbox' : 'radio', name: `${key}:${question.id}`, checked: value.selected.includes(option.label),
+                  onChange: event => editInteractionAnswer(run, request, question, { selected: question.multiSelect ? (event.target.checked ? [...new Set(value.selected.concat(option.label))] : value.selected.filter(label => label !== option.label)) : [option.label], ...(question.multiSelect ? {} : { custom: '' }) }) }),
+                React.createElement('span', null, option.label, option.description ? React.createElement('small', null, option.description) : null))),
+              React.createElement('textarea', { 'aria-label': `${question.question}（自定义回复）`, value: value.custom, placeholder: '或输入回复',
+                onChange: event => editInteractionAnswer(run, request, question, { custom: event.target.value, ...(question.multiSelect ? {} : { selected: [] }) }) }),
+            )
+          }),
+          request.requiresHuman ? React.createElement('p', { className: 'dsh-hub-remote-description' }, '计划审核需要你亲自确认。') : null,
+          React.createElement('button', { type: 'button', className: 'dsh-hub-action', disabled: disabled || !complete, onClick: () => sendInteractionResponse(run, request, { answers }) }, respondingInteraction === key ? '提交中…' : '提交回复'),
+        ),
+      )
+    }
     let settingsParentOrigin = null
     const remoteUnavailable = '远控连接请使用根路径 loopback 页面（localhost、127.* 或 [::1]）；代理页面仍可使用原有 Hub 功能。'
 
@@ -519,6 +645,7 @@ window.__ModuleLoader__.load({
     }
 
     async function openRemoteSettings(parentOrigin = null) {
+      stopInteractionRefresh()
       const epoch = ++remoteEpoch
       settingsParentOrigin = parentOrigin
       publishRemote({ kind: 'settings', target: null, loading: true, saving: false, config: null, error: null, notice: '' })
@@ -535,6 +662,8 @@ window.__ModuleLoader__.load({
     }
 
     function closeRemoteModal(notify = true) {
+      stopInteractionRefresh()
+      interactionDrafts = {}
       if (notify && remoteSnapshot.kind === 'settings') notifySettingsParent(REMOTE_CLOSED)
       settingsParentOrigin = null
       remoteEpoch += 1
@@ -601,6 +730,7 @@ window.__ModuleLoader__.load({
           let name
           try {
             const port = Number(new URL(connection.endpoint).port)
+            if (preferences.hiddenPorts.includes(port)) continue
             name = preferences.names[connection.endpoint] || preferences.names[instanceURL(port)] || preferences.names[String(port)]
           } catch { continue }
           if (typeof name !== 'string' || !name.trim() || /[\u0000-\u001f\u007f-\u009f]/.test(name)) continue
@@ -629,6 +759,7 @@ window.__ModuleLoader__.load({
     }
 
     async function openRemotePanel(item = null, notice = '') {
+      stopInteractionRefresh()
       const target = item && item.source !== 'local' ? item : null
       const epoch = ++remoteEpoch
       settingsParentOrigin = null
@@ -642,6 +773,7 @@ window.__ModuleLoader__.load({
         ])
         if (epoch === remoteEpoch) publishRemote({ waitForResult: config ? config.waitForResult === true : null,
           runs: activity && Array.isArray(activity.runs) ? activity.runs : [], loading: false })
+        if (epoch === remoteEpoch && remoteControlAvailable()) startInteractionRefresh(epoch)
       } catch (error) {
         if (epoch === remoteEpoch) publishRemote({ loading: false, error: remoteError(error) })
       }
@@ -649,6 +781,7 @@ window.__ModuleLoader__.load({
 
     async function connectRemoteInstance(item) {
       if (!remoteControlAvailable()) { publishRemote({ notice: remoteUnavailable }); return }
+      stopInteractionRefresh()
       const epoch = ++remoteEpoch
       const revision = ++connectionsRevision
       publishRemote({ kind: 'manager', target: item, loading: true, error: null, notice: `正在连接远程 :${item.port}…` })
@@ -660,6 +793,8 @@ window.__ModuleLoader__.load({
         if (epoch === remoteEpoch) publishRemote({ loading: false, notice: `远程 :${item.port} 已连接；回到主控聊天，告诉 Agent 要派出的任务即可。` })
       } catch (error) {
         if (epoch === remoteEpoch) publishRemote({ loading: false, error: remoteError(error), notice: '' })
+      } finally {
+        if (epoch === remoteEpoch && remoteSnapshot.kind === 'manager') startInteractionRefresh(epoch)
       }
     }
 
@@ -722,6 +857,8 @@ window.__ModuleLoader__.load({
       }
       window.addEventListener('message', onMessage)
       return () => {
+        stopInteractionRefresh()
+        interactionDrafts = {}
         window.removeEventListener('message', onMessage)
         childFrames.clear()
         pendingSettingsTarget = null
@@ -795,6 +932,7 @@ window.__ModuleLoader__.load({
             )),
           ) : null,
           !settingsOnly && !target && !snapshot.loading && snapshot.connectionsKnown && !snapshot.connections.length ? React.createElement('p', null, '尚未连接远程。请在 Hub 选中要使用的实例，打开「远控设置」。') : null,
+          !settingsOnly ? snapshot.runs.filter(run => !['completed', 'error', 'interrupted'].includes(run.state) && (!target || (connected && run.targetId === connected.targetId))).flatMap(run => (run.requests || []).map(request => interactionCard(run, request, snapshot))) : null,
           !settingsOnly && !target && snapshot.runs.length ? React.createElement('details', null, React.createElement('summary', null, '任务记录'), snapshot.runs.map((run) => React.createElement('p', { key: run.runId }, `${run.description || run.runId} · ${run.state || 'unknown'}`))) : null,
           React.createElement('div', { className: 'dsh-hub-remote-actions' },
             !settingsOnly ? React.createElement('button', { type: 'button', className: 'dsh-hub-action', disabled: snapshot.loading || snapshot.saving || snapshot.savingMode, onClick: () => openRemotePanel(target) }, '刷新') : null,
@@ -871,15 +1009,39 @@ window.__ModuleLoader__.load({
           return
         }
         const preferences = readPreferences()
-        const nextPreferences = preferences.manualPorts.includes(port)
-          ? preferences
-          : { names: preferences.names, manualPorts: preferences.manualPorts.concat(port) }
+        const nextPreferences = { ...preferences,
+          manualPorts: preferences.manualPorts.includes(port) ? preferences.manualPorts : preferences.manualPorts.concat(port),
+          hiddenPorts: preferences.hiddenPorts.filter(hidden => hidden !== port),
+        }
         storePreferences(nextPreferences)
         const id = instanceURL(port)
         setActiveServer(id)
         setPendingId(id)
         setManualPort('')
         setStatus(`正在添加并检测端口 ${port}`)
+      }
+
+      const removeSelected = () => {
+        const target = hubSnapshot.instances.find(item => item.id === hubSnapshot.activeId)
+        if (!target || target.source === 'local') return
+        const explanation = `从 Hub 标签栏移除“${target.label}”（端口 ${target.port}）？\n不会停止实例、断开远控连接或终止任务。重新输入该端口并点击「+」即可恢复。`
+        if (typeof window.confirm !== 'function' || !window.confirm(explanation)) return
+        const preferences = readPreferences()
+        const next = { ...preferences, manualPorts: preferences.manualPorts.filter(port => port !== target.port),
+          hiddenPorts: [...new Set(preferences.hiddenPorts.concat(target.port))] }
+        const persisted = storePreferences(next)
+        const instances = hubSnapshot.instances.filter(item => item.source === 'local' || !next.hiddenPorts.includes(item.port))
+        const liveIds = new Set(instances.map(item => item.id))
+        const activeId = liveIds.has(hubSnapshot.activeId) ? hubSnapshot.activeId : (instances.find(item => item.source === 'local') || instances[0])?.id || null
+        publishHub({ instances, activeId, states: Object.fromEntries(Object.entries(hubSnapshot.states).filter(([id]) => liveIds.has(id))) })
+        setPendingId(null)
+        setReadyIds(current => { const ready = { ...current }; delete ready[target.id]; return ready })
+        childFrames.delete(target.id)
+        if (pendingSettingsTarget?.id === target.id) pendingSettingsTarget = null
+        if (remoteSnapshot.target?.id === target.id) closeRemoteModal(false)
+        const message = `已移除“${target.label}”；重新添加端口 ${target.port} 可恢复${persisted ? '' : '。浏览器未能保存，刷新后可能恢复'}`
+        setStatus(message)
+        publishRemote({ notice: message })
       }
 
       const beginRename = () => {
@@ -909,7 +1071,7 @@ window.__ModuleLoader__.load({
           delete names[target.originalUrl]
           if (value) names[target.url] = value
           else delete names[target.url]
-          storePreferences({ names, manualPorts: preferences.manualPorts })
+          storePreferences({ ...preferences, names })
           refreshInstanceNames()
           setStatus(value ? `已命名为“${value}”${connection ? '，Agent 可按此名称识别' : target.source !== 'local' ? '，连接后同步给 Agent' : ''}` : '已恢复默认名称')
           setRenameId(null)
@@ -919,6 +1081,7 @@ window.__ModuleLoader__.load({
       }
 
       const selectInstance = (item) => {
+        if (item.source !== 'local' && readPreferences().hiddenPorts.includes(item.port)) return
         markServerRead(item.id)
         if (item.id === selectedId) return
         if (readyIds[item.id] || selectedId === null) {
@@ -931,6 +1094,7 @@ window.__ModuleLoader__.load({
       }
 
       const markFrameReady = (item) => {
+        if (item.source !== 'local' && readPreferences().hiddenPorts.includes(item.port)) return
         setReadyIds((current) => current[item.id] ? current : Object.assign({}, current, { [item.id]: true }))
         if (pendingId === item.id) {
           setPendingId(null)
@@ -1012,6 +1176,7 @@ window.__ModuleLoader__.load({
             }),
             React.createElement('button', { type: 'button', className: 'dsh-hub-action', onClick: addManual, title: '手动添加端口' }, '+'),
             React.createElement('button', { type: 'button', className: 'dsh-hub-action', disabled: !selectedId, onClick: beginRename, title: '命名当前服务器' }, '命名'),
+            React.createElement('button', { type: 'button', className: 'dsh-hub-action is-remove', disabled: !selectedInstance || selectedInstance.source === 'local', onClick: removeSelected, title: '从 Hub 标签栏移除；不会停止实例或断开远控，重新添加端口可恢复' }, '移除'),
           )
 
       const brandGlyph = mode === 'waiting' ? '!' : mode === 'completed' ? '✓' : ''
