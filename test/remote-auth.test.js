@@ -86,16 +86,227 @@ test('connect validates enabled catalog before privately persisting the exact ta
   assert.ok(f.calls[0].options.signal instanceof AbortSignal)
 })
 
-test('private-store failure produces a safe actionable code instead of leaking the native cookie', async () => {
+test('legacy records omit name until explicitly renamed, including after reconnect', async () => {
   const f = fixture()
-  f.ctx.credentials.modifyRecord = async () => { throw new Error(`write denied for ${expectedCookie}`) }
-  await assert.rejects(f.connections.connect(req(), { endpoint }), error => {
-    assert.equal(error.code, 'REMOTE_STORAGE')
-    assert.match(error.message, /无法保存连接信息/)
-    assert.doesNotMatch(error.message, /v1\.|dsh-auth-/)
-    return true
+  const connected = await f.connections.connect(req(), { endpoint })
+  assert.equal(Object.hasOwn(connected, 'name'), false)
+  const [key, record] = [...f.records][0]
+  assert.equal(Object.hasOwn(record.payload, 'name'), false)
+  assert.deepEqual(await f.connections.list(), [connected])
+  assert.deepEqual(await f.connections.connect(req(), { endpoint }), connected)
+  assert.deepEqual(await f.connections.get(connected.targetId), { endpoint: `${endpoint}/`, cookie: expectedCookie, instanceId: connected.instanceId })
+  const renamed = await f.connections.rename(connected.targetId, '  Legacy worker  ')
+  assert.deepEqual(renamed, { ...connected, name: 'Legacy worker' })
+  assert.equal(f.records.get(key).payload.name, 'Legacy worker')
+})
+
+test('connect trims and persists optional names without changing identity; duplicate names are allowed', async () => {
+  const f = fixture()
+  const connected = await f.connections.connect(req(), { endpoint, name: '  工作节点 A  ' })
+  assert.equal(connected.name, '工作节点 A')
+  assert.equal([...f.records.values()][0].payload.name, connected.name)
+  assert.deepEqual(await f.connections.list(), [connected])
+  noPrivateFields(connected)
+  const secondEndpoint = 'http://127.0.0.1:3082'
+  const second = await f.connections.connect({ headers: { host: req().headers.host, cookie: nativeCookie(secondEndpoint) } }, { endpoint: secondEndpoint, name: connected.name })
+  assert.equal(second.name, connected.name)
+  assert.notEqual(second.targetId, connected.targetId)
+  assert.notEqual(second.endpoint, connected.endpoint)
+  const unnamed = fixture()
+  const original = await unnamed.connections.connect(req(), { endpoint })
+  assert.deepEqual(connected, { ...original, name: '工作节点 A' })
+  assert.equal((await f.connections.connect(req(), { endpoint, name: '  ' })).name, '')
+  assert.equal([...f.records.values()][0].payload.name, '')
+  assert.equal((await f.connections.connect(req(), { endpoint, name: 'x'.repeat(40) })).name.length, 40)
+})
+
+test('rename and clear persist across manager recreation using only modifyRecord, without changing private payload or identity', async () => {
+  const f = fixture()
+  const original = await f.connections.connect(req(), { endpoint, name: 'Original' })
+  const [key, record] = [...f.records][0]
+  record.payload.extra = { token: 'private-sentinel', future: true }
+  record.metadata = { future: 'preserve' }
+  f.records.set(key, record)
+  const readRecord = f.ctx.credentials.readRecord
+  let modifications = 0
+  const modifyRecord = f.ctx.credentials.modifyRecord
+  f.ctx.credentials.modifyRecord = async (...args) => { modifications += 1; return modifyRecord(...args) }
+  f.ctx.credentials.readRecord = async () => { throw new Error('rename must not read credentials separately') }
+  f.ctx.credentials.listRecords = async () => { throw new Error('rename must not list credentials') }
+  f.connections.get = async () => { throw new Error('rename must not retrieve target cookies') }
+  f.connections.fetchImpl = async () => { throw new Error('rename must not contact target') }
+  const callsBefore = f.calls.length
+  const renamed = await f.connections.rename(original.targetId, '  New worker  ')
+  assert.deepEqual(renamed, { ...original, name: 'New worker' })
+  assert.deepEqual(f.records.get(key), { ...record, payload: { ...record.payload, name: 'New worker' } })
+  noPrivateFields(renamed)
+  const cleared = await f.connections.rename(original.targetId, '')
+  assert.deepEqual(cleared, { ...original, name: '' })
+  assert.equal(Object.hasOwn(cleared, 'name'), true)
+  assert.deepEqual(f.records.get(key), { ...record, payload: { ...record.payload, name: '' } })
+  noPrivateFields(cleared)
+  assert.equal(modifications, 2)
+  assert.equal(f.calls.length, callsBefore)
+  f.ctx.credentials.readRecord = readRecord
+  f.ctx.credentials.listRecords = async () => [...f.records].map(([key, value]) => ({ key, kind: value.kind }))
+  const recreated = new RemoteConnections(f.ctx, { fetchImpl: async () => { throw new Error('listing must not contact target') } })
+  assert.deepEqual(await recreated.list(), [cleared])
+  assert.deepEqual(await recreated.get(original.targetId), { endpoint: original.endpoint, cookie: expectedCookie, instanceId: original.instanceId })
+})
+
+test('onlyIfUnset migrates missing names locally but never overwrites named or explicitly cleared records', async t => {
+  for (const [label, input] of [
+    ['missing', { endpoint }], ['existing', { endpoint, name: 'Current worker' }], ['cleared', { endpoint, name: '' }],
+  ]) await t.test(label, async () => {
+    const f = fixture()
+    const original = await f.connections.connect(req(), input)
+    const [key, record] = [...f.records][0]
+    let writes = 0
+    f.ctx.credentials.modifyRecord = async (key, mutate) => {
+      const next = await mutate(structuredClone(f.records.get(key)))
+      if (next !== undefined) { writes += 1; f.records.set(key, structuredClone(next)) }
+      return structuredClone(f.records.get(key))
+    }
+    f.ctx.credentials.readRecord = async () => { throw new Error('migration must only use modifyRecord') }
+    f.ctx.credentials.listRecords = async () => { throw new Error('migration must not list credentials') }
+    f.connections.get = async () => { throw new Error('migration must not retrieve target cookies') }
+    f.connections.fetchImpl = async () => { throw new Error('migration must not contact target') }
+    const migrated = await f.connections.rename(original.targetId, '  Legacy cache  ', { onlyIfUnset: true })
+    const hasName = Object.hasOwn(record.payload, 'name')
+    assert.deepEqual(migrated, hasName ? original : { ...original, name: 'Legacy cache' })
+    assert.deepEqual(f.records.get(key), hasName ? record : { ...record, payload: { ...record.payload, name: 'Legacy cache' } })
+    assert.equal(writes, hasName ? 0 : 1)
+    noPrivateFields(migrated)
+    const repeated = await f.connections.rename(original.targetId, 'Stale browser cache', { onlyIfUnset: true })
+    assert.deepEqual(repeated, migrated)
+    assert.equal(writes, hasName ? 0 : 1)
+    const explicit = await f.connections.rename(original.targetId, 'Manual rename', { onlyIfUnset: false })
+    assert.deepEqual(explicit, { ...original, name: 'Manual rename' })
+    assert.equal(f.records.get(key).payload.name, 'Manual rename')
+    assert.equal(writes, hasName ? 1 : 2)
+    assert.equal(f.calls.length, 1)
   })
+})
+
+test('onlyIfUnset checks the latest payload inside modifyRecord rather than an earlier browser snapshot', async t => {
+  for (const latestName of ['New browser name', '']) await t.test(latestName || 'cleared by another browser', async () => {
+    const f = fixture()
+    const original = await f.connections.connect(req(), { endpoint })
+    const [key, record] = [...f.records][0]
+    f.ctx.credentials.readRecord = async () => { throw new Error('migration must not read a stale snapshot') }
+    f.connections.fetchImpl = async () => { throw new Error('migration must not contact target') }
+    f.ctx.credentials.modifyRecord = async (key, mutate) => {
+      const latest = { ...record, payload: { ...record.payload, name: latestName } }
+      f.records.set(key, latest)
+      assert.equal(await mutate(structuredClone(latest)), undefined)
+      return structuredClone(latest)
+    }
+    const result = await f.connections.rename(original.targetId, 'Old browser cache', { onlyIfUnset: true })
+    assert.deepEqual(result, { ...original, name: latestName })
+    assert.deepEqual(f.records.get(key), { ...record, payload: { ...record.payload, name: latestName } })
+    noPrivateFields(result)
+    assert.equal(f.calls.length, 1)
+  })
+})
+
+test('reconnect keeps saved names when omitted and replaces or clears them only when explicit', async () => {
+  const f = fixture()
+  const connected = await f.connections.connect(req(), { endpoint, name: 'First' })
+  await f.connections.rename(connected.targetId, 'Renamed')
+  assert.deepEqual(await f.connections.connect(req(), { endpoint }), { ...connected, name: 'Renamed' })
+  const changed = await f.connections.connect(req(), { endpoint, name: '  Replacement  ' })
+  assert.deepEqual(changed, { ...connected, name: 'Replacement' })
+  const cleared = await f.connections.connect(req(), { endpoint, name: '' })
+  assert.deepEqual(cleared, { ...connected, name: '' })
+  assert.deepEqual(await f.connections.connect(req(), { endpoint }), cleared)
+  assert.equal([...f.records.values()][0].payload.name, '')
+})
+
+test('connect and rename reject invalid name types, trimmed length and control characters before network or writes', async t => {
+  for (const [label, name] of [
+    ['undefined', undefined], ['null', null], ['number', 12], ['boolean', false], ['object', {}], ['array', []],
+    ['too long', 'x'.repeat(41)], ['too long after trimming', ` ${'x'.repeat(41)} `],
+    ['nul', 'a\u0000b'], ['newline before trim', '\nworker'], ['tab after trim', 'worker\t'],
+    ['carriage return', 'a\rb'], ['DEL', 'a\u007fb'], ['C1 control', 'a\u0085b'],
+  ]) await t.test(label, async () => {
+    const f = fixture()
+    const connected = await f.connections.connect(req(), { endpoint, name: 'Unchanged' })
+    const before = structuredClone([...f.records])
+    const callsBefore = f.calls.length
+    f.ctx.credentials.modifyRecord = async () => { throw new Error('Invalid name must fail before touching storage') }
+    await rejectsCode(f.connections.connect(req(), { endpoint, name }), 'REMOTE_NAME')
+    await rejectsCode(f.connections.rename(connected.targetId, name), 'REMOTE_NAME')
+    assert.deepEqual([...f.records], before)
+    assert.equal(f.calls.length, callsBefore)
+  })
+})
+
+test('stored validates optional names while accepting absent and explicitly empty names', async t => {
+  for (const name of [undefined, null, 1, {}, 'x'.repeat(41), 'a\u0000b', 'a\u009fb', ' not trimmed ']) await t.test(String(name), async () => {
+    const f = fixture()
+    const connected = await f.connections.connect(req(), { endpoint })
+    const [key, record] = [...f.records][0]
+    record.payload.name = name
+    f.records.set(key, record)
+    await rejectsCode(f.connections.list(), 'REMOTE_CONNECTION_INVALID')
+    await rejectsCode(f.connections.rename(connected.targetId, 'Valid'), 'REMOTE_CONNECTION_INVALID')
+    assert.deepEqual(f.records.get(key), record)
+  })
+  const f = fixture()
+  const connected = await f.connections.connect(req(), { endpoint, name: '' })
+  assert.deepEqual(await f.connections.list(), [connected])
+  assert.equal(Object.hasOwn(connected, 'name'), true)
+})
+
+test('rename refuses missing connections without creating records or contacting targets', async () => {
+  const f = fixture()
+  const missing = `remote-${'0'.repeat(24)}`
+  await rejectsCode(f.connections.rename(missing, 'Worker'), 'REMOTE_CONNECTION_MISSING')
+  await rejectsCode(f.connections.rename('alias', 'Worker'), 'REMOTE_CONNECTION_MISSING')
   assert.equal(f.records.size, 0)
+  assert.equal(f.calls.length, 0)
+})
+
+test('rename storage errors are safe even after mutation validation and do not leak private error properties', async t => {
+  for (const afterMutation of [false, true]) await t.test(afterMutation ? 'after mutation callback' : 'before mutation callback', async () => {
+    const f = fixture()
+    const connected = await f.connections.connect(req(), { endpoint, name: 'Unchanged' })
+    const before = structuredClone([...f.records])
+    f.ctx.credentials.modifyRecord = async (key, mutate) => {
+      if (afterMutation) await mutate(structuredClone(f.records.get(key)))
+      throw Object.assign(new Error(`write failed: ${expectedCookie}`), { code: 'REMOTE_UNTRUSTED_STORAGE', cookie: expectedCookie })
+    }
+    await assert.rejects(f.connections.rename(connected.targetId, 'Changed'), error => {
+      assert.equal(error.code, 'REMOTE_STORAGE')
+      assert.match(error.message, /无法保存连接信息/)
+      assert.doesNotMatch(error.message, /v1\.|dsh-auth-/)
+      assert.deepEqual(Object.keys(error), ['code'])
+      return true
+    })
+    assert.deepEqual([...f.records], before)
+    assert.equal(f.calls.length, 1)
+  })
+})
+
+test('private-store failure produces a safe actionable code instead of leaking the native cookie', async t => {
+  for (const [label, storageError] of [
+    ['ordinary error', new Error(`write denied for ${expectedCookie}`)],
+    ['untrusted remote code', Object.assign(new Error(`write denied for ${expectedCookie}`), { code: 'REMOTE_STORAGE' })],
+    ['null error', null], ['undefined error', undefined],
+  ]) await t.test(label, async () => {
+    const f = fixture()
+    f.ctx.credentials.modifyRecord = async () => { throw storageError }
+    for (const action of [
+      () => f.connections.connect(req(), { endpoint }),
+      () => f.connections.rename(`remote-${'0'.repeat(24)}`, 'Worker'),
+    ]) await assert.rejects(action(), error => {
+      assert.equal(error.code, 'REMOTE_STORAGE')
+      assert.match(error.message, /无法保存连接信息/)
+      assert.doesNotMatch(error.message, /v1\.|dsh-auth-/)
+      return true
+    })
+    assert.equal(f.records.size, 0)
+  })
 })
 
 test('credentials remain own-port and own-scope; discovery/list never collects cookies or contacts targets', async () => {

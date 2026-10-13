@@ -5,7 +5,7 @@ let sequence = 0
 const OPEN = 'dsh-hub-remote-settings/open'
 const SAVED = 'dsh-hub-remote-settings/saved'
 const CLOSED = 'dsh-hub-remote-settings/closed'
-const config = { version: 1, instanceId: 'worker', enabled: false, workspaceIds: [], workspaces: [{ id: 'sr', title: 'SR project', path: '/projects/sr' }] }
+const config = { version: 1, instanceId: 'worker', enabled: false, waitForResult: false, workspaceIds: [], workspaces: [{ id: 'sr', title: 'SR project', path: '/projects/sr' }] }
 const overview = {
   instances: [
     { port: 3080, url: 'http://127.0.0.1:3080/', source: 'local' },
@@ -26,7 +26,10 @@ async function harness({ base = 'http://localhost:3080/', embedded = false, refe
       title: 'DeepSeek Harness', baseURI: base, referrer: embedded ? referrer : '',
       createElement: () => ({ dataset: {}, remove() { removedStyle = true } }), head: { appendChild() {} },
     },
-    localStorage: { getItem(key) { return key === 'dsh-server-hub.preferences.v1' ? JSON.stringify({ names, manualPorts: [] }) : null }, setItem() {} },
+    localStorage: {
+      getItem(key) { return key === 'dsh-server-hub.preferences.v1' ? JSON.stringify({ names, manualPorts: [] }) : null },
+      setItem(key, value) { if (key === 'dsh-server-hub.preferences.v1') names = JSON.parse(value).names },
+    },
     addEventListener(type, callback) { listeners.set(type, callback) },
     removeEventListener(type, callback) { if (listeners.get(type) === callback) listeners.delete(type) },
     setInterval(callback) { intervals.set(++intervalId, callback); return intervalId },
@@ -41,11 +44,18 @@ async function harness({ base = 'http://localhost:3080/', embedded = false, refe
         if (options.method === 'PUT') savedConfig = { ...savedConfig, ...JSON.parse(options.body) }
         value = savedConfig
       } else if (url.endsWith('/connections') && options.method === 'POST') {
-        const connected = { ...connection, endpoint: JSON.parse(options.body).endpoint }
+        const connected = { ...connection, ...JSON.parse(options.body) }
         savedConnections = [connected]
         value = { connection: connected }
       } else if (url.endsWith('/connections')) value = { connections: savedConnections }
       else if (url.endsWith('/activity')) value = { runs: [{ runId: 'r1', sessionId: 's1', state: 'running', description: 'Check CPU' }] }
+      else if (options.method === 'PUT' && url.includes('/connections/')) {
+        const input = JSON.parse(options.body)
+        const saved = savedConnections.find(entry => entry.targetId === decodeURIComponent(url.split('/').at(-1)))
+        assert.ok(saved, 'rename must target an existing connection')
+        if (!input.onlyIfUnset || !Object.hasOwn(saved, 'name')) saved.name = input.name
+        value = { connection: saved }
+      }
       else if (options.method === 'DELETE') { savedConnections = []; return { ok: true, status: 204 } }
       else throw new Error(`Unexpected fetch: ${url}`)
       return { ok: true, status: 200, json: async () => structuredClone(value) }
@@ -122,15 +132,54 @@ async function openWorker(h) { await button(selectWorker(h), '远控设置').pro
 test('toolbar has one remote entry; local controller explains self instead of a grey connection button', async () => {
   const h = await harness()
   const labels = nodes(h.panel()).filter(node => node.type === 'button').map(text)
-  assert.equal(labels.filter(label => label === '执行端管理').length, 1)
+  assert.equal(labels.filter(label => label === '远程管理').length, 1)
   for (const old of ['主控', '远程 Agent', '远控配置', '连接远控', '远控目标']) assert.equal(labels.includes(old), false)
   assert.equal(h.requests.length, 0)
-  await button(h.panel(), '执行端管理').props.onClick()
+  await button(h.panel(), '远程管理').props.onClick()
   assert.match(text(h.modal()), /主控 :3080 · 无需连接自己/)
-  assert.equal(nodes(h.modal()).some(node => node.type === 'button' && /连接执行端/.test(text(node))), false)
-  assert.equal(nodes(h.modal()).some(node => node.type === 'input'), false)
-  assert.equal(nodes(h.modal()).find(node => node.type === 'h2').props.children[0], '执行端管理')
+  assert.equal(nodes(h.modal()).some(node => node.type === 'button' && /连接远程/.test(text(node))), false)
+  assert.equal(nodes(h.modal()).filter(node => node.type === 'input').length, 1, 'main panel exposes reply mode only')
+  assert.equal(nodes(h.modal()).find(node => node.type === 'h2').props.children[0], '远程管理')
   h.cleanup()
+})
+
+test('main exposes an immediate persistent single-turn switch without modifying workspace permissions', async () => {
+  const h = await harness()
+  await button(h.panel(), '远程管理').props.onClick()
+  assert.match(text(h.modal()), /单轮回复（等待远程结果）/)
+  let toggle = nodes(h.modal()).find(node => node.type === 'input')
+  assert.equal(toggle.props.checked, false)
+  await toggle.props.onChange({ target: { checked: true } })
+  assert.deepEqual(JSON.parse(h.requests.at(-1).options.body), { waitForResult: true })
+  assert.equal(h.requests.at(-1).options.method, 'PUT')
+  assert.equal(h.requests.at(-1).options.credentials, 'same-origin')
+  assert.match(text(h.modal()), /单轮回复已开启/)
+  button(h.modal(), '关闭').props.onClick()
+  await button(h.panel(), '远程管理').props.onClick()
+  toggle = nodes(h.modal()).find(node => node.type === 'input')
+  assert.equal(toggle.props.checked, true)
+  await toggle.props.onChange({ target: { checked: false } })
+  assert.deepEqual(JSON.parse(h.requests.at(-1).options.body), { waitForResult: false })
+  assert.match(text(h.modal()), /后台回报/)
+  assert.equal(h.requests.some(request => request.options.method === 'POST'), false)
+  h.cleanup()
+})
+
+test('single-turn switch rolls back on save failure and never appears in a remote settings page', async () => {
+  const h = await harness({ fetch: async (url, options) => options.method === 'PUT'
+    ? { ok: false, status: 400, json: async () => ({ error: 'private' }) }
+    : { ok: true, status: 200, json: async () => url.endsWith('/config') ? config : url.endsWith('/connections') ? { connections: [] } : { runs: [] } } })
+  await button(h.panel(), '远程管理').props.onClick()
+  await nodes(h.modal()).find(node => node.type === 'input').props.onChange({ target: { checked: true } })
+  assert.equal(nodes(h.modal()).find(node => node.type === 'input').props.checked, false)
+  assert.match(text(h.modal()), /HTTP 400/)
+  assert.doesNotMatch(text(h.modal()), /private/)
+  h.cleanup()
+  const child = await harness({ base: 'http://localhost:3081/', embedded: true })
+  child.message(child.parent, 'http://localhost:3080', OPEN)
+  await tick()
+  assert.doesNotMatch(text(child.modal()), /单轮回复/)
+  child.cleanup()
 })
 
 function instanceTab(h, port) {
@@ -146,26 +195,87 @@ test('roles stay anchored to main page; labels preserve custom names and known c
   assert.equal(local.props['data-dsh-hub-role'], 'controller')
   assert.match(text(local), /主控 · 开发主机 · 3080/)
   assert.equal(worker.props['data-dsh-hub-role'], 'worker')
-  assert.match(text(worker), /执行端 · 维护实例 · 3081.*已连接/)
+  assert.match(text(worker), /远程 · 维护实例 · 3081.*已连接/)
   assert.equal(worker.props['data-dsh-hub-connection'], '已连接')
   assert.equal(h.modal(), null, 'connection badge must work without opening settings')
   worker.props.onClick()
   assert.ok(button(h.panel(), '远控设置'))
   assert.equal(instanceTab(h, 3080).props['data-dsh-hub-role'], 'controller')
   await button(h.panel(), '远控设置').props.onClick()
-  assert.match(text(h.modal()), /执行端 :3081 接受主控 :3080/)
+  assert.match(text(h.modal()), /远程 :3081 接受主控 :3080/)
   assert.match(text(h.modal()), /SR project/)
-  assert.equal(nodes(h.modal()).some(node => node.type === 'button' && text(node).startsWith('连接执行端')), false)
+  assert.equal(nodes(h.modal()).some(node => node.type === 'button' && text(node).startsWith('连接远程')), false)
   assert.ok(button(h.modal(), '修改工作区'))
   assert.ok(button(h.modal(), '断开连接'))
-  assert.doesNotMatch(text(h.modal()), /本机尚未接入|已连接的执行端|尚未连接执行端|访问许可|登录/)
+  assert.doesNotMatch(text(h.modal()), /本机尚未接入|已连接的远程|尚未连接远程|访问许可|登录/)
   instanceTab(h, 3080).props.onClick()
-  await button(h.panel(), '执行端管理').props.onClick()
-  assert.equal(nodes(h.modal()).find(node => node.type === 'h2').props.children[0], '执行端管理')
-  assert.match(text(h.modal()), /已连接的执行端.*SR project/)
-  assert.equal(nodes(h.modal()).some(node => node.type === 'input'), false)
+  await button(h.panel(), '远程管理').props.onClick()
+  assert.equal(nodes(h.modal()).find(node => node.type === 'h2').props.children[0], '远程管理')
+  assert.match(text(h.modal()), /已连接的远程.*SR project/)
+  assert.equal(nodes(h.modal()).filter(node => node.type === 'input').length, 1, 'main panel exposes reply mode only')
   const records = nodes(h.modal()).find(node => node.type === 'details')
   assert.ok(records); assert.equal(records.props.open, undefined, 'task records default closed')
+  h.cleanup()
+})
+
+async function renameSelected(h, name) {
+  button(h.panel(), '命名').props.onClick()
+  const input = nodes(h.panel()).find(node => node.type === 'input' && node.props.className?.includes('dsh-hub-name-input'))
+  assert.ok(input)
+  input.props.onChange({ target: { value: name } })
+  await button(h.panel(), '✓').props.onClick()
+}
+
+test('connected names migrate from browser preferences once, without reconnecting', async () => {
+  const h = await harness({ initialConnections: [connection], names: { '3081': '197服务器' } })
+  await h.mountMonitor()
+  const writes = h.requests.filter(request => request.options.method === 'PUT')
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0].url, 'api/dsh-server-hub/remote/connections/target-3081')
+  assert.deepEqual(JSON.parse(writes[0].options.body), { name: '197服务器', onlyIfUnset: true })
+  assert.match(text(instanceTab(h, 3081)), /远程 · 197服务器 · 3081/)
+  await button(h.panel(), '↻').props.onClick()
+  assert.equal(h.requests.filter(request => request.options.method === 'PUT').length, 1)
+  assert.equal(h.requests.some(request => request.options.method === 'POST'), false)
+  h.cleanup()
+})
+
+test('backend name wins over old browser cache, including an explicitly cleared name', async () => {
+  for (const name of ['服务器新名', '']) {
+    const h = await harness({ initialConnections: [{ ...connection, name }], names: { '3081': '旧浏览器名称' } })
+    await h.mountMonitor()
+    assert.doesNotMatch(text(instanceTab(h, 3081)), /旧浏览器名称/)
+    if (name) assert.match(text(instanceTab(h, 3081)), /服务器新名/)
+    assert.equal(h.requests.some(request => request.options.method === 'PUT'), false)
+    h.cleanup()
+  }
+})
+
+test('renaming a connected remote updates its stored name and clearing survives reload', async () => {
+  const h = await harness({ initialConnections: [{ ...connection, name: '已有名称' }] })
+  await h.mountMonitor(); registerFrames(h); selectWorker(h)
+  await renameSelected(h, '197服务器')
+  assert.match(text(instanceTab(h, 3081)), /197服务器/)
+  let request = h.requests.find(request => request.options.method === 'PUT')
+  assert.equal(request.url, 'api/dsh-server-hub/remote/connections/target-3081')
+  assert.deepEqual(JSON.parse(request.options.body), { name: '197服务器' })
+  assert.equal(request.options.credentials, 'same-origin')
+  await renameSelected(h, '')
+  await button(h.panel(), '↻').props.onClick()
+  assert.doesNotMatch(text(instanceTab(h, 3081)), /已有名称|197服务器/)
+  assert.equal(h.requests.some(request => request.options.method === 'POST'), false)
+  h.cleanup()
+})
+
+test('an unconnected name is included only in a later explicit connection', async () => {
+  const h = await harness()
+  await h.mountMonitor(); registerFrames(h); selectWorker(h)
+  await renameSelected(h, '197服务器')
+  assert.equal(h.requests.some(request => request.options.method === 'PUT' || request.options.method === 'POST'), false)
+  await openWorker(h)
+  await button(h.modal(), '连接远程 :3081').props.onClick()
+  const request = h.requests.find(request => request.options.method === 'POST')
+  assert.deepEqual(JSON.parse(request.options.body), { endpoint: 'http://localhost:3081/', name: '197服务器' })
   h.cleanup()
 })
 
@@ -181,8 +291,8 @@ test('controller identity follows the current main instance, not a hardcoded por
   assert.equal(instanceTab(h, 3080).props['data-dsh-hub-role'], 'worker')
   instanceTab(h, 3080).props.onClick()
   await button(h.panel(), '远控设置').props.onClick()
-  assert.match(text(h.modal()), /执行端 :3080 接受主控 :3081/)
-  assert.ok(button(h.modal(), '连接执行端 :3080'))
+  assert.match(text(h.modal()), /远程 :3080 接受主控 :3081/)
+  assert.ok(button(h.modal(), '连接远程 :3080'))
   h.cleanup()
 })
 
@@ -192,7 +302,7 @@ test('connect/disconnect update tab badges immediately and task status remains s
   assert.equal(instanceTab(h, 3081).props['data-dsh-hub-connection'], '未连接')
   assert.match(instanceTab(h, 3081).props.title, /2 个 Agent 工作中/)
   await openWorker(h)
-  await button(h.modal(), '连接执行端 :3081').props.onClick()
+  await button(h.modal(), '连接远程 :3081').props.onClick()
   assert.equal(instanceTab(h, 3081).props['data-dsh-hub-connection'], '已连接')
   await button(h.modal(), '断开连接').props.onClick()
   assert.equal(instanceTab(h, 3081).props['data-dsh-hub-connection'], '未连接')
@@ -227,7 +337,7 @@ test('failed connection read is unknown, not disconnected; late old read cannot 
     return { ok: true, status: 200, json: async () => url.includes('/overview') ? overview : options.method === 'POST' ? { connection } : url.endsWith('/connections') ? { connections: [] } : { runs: [] } }
   } })
   await h.mountMonitor(); registerFrames(h); await openWorker(h)
-  await button(h.modal(), '连接执行端 :3081').props.onClick()
+  await button(h.modal(), '连接远程 :3081').props.onClick()
   finish({ ok: true, json: async () => ({ connections: [] }) })
   await tick()
   assert.equal(instanceTab(h, 3081).props['data-dsh-hub-connection'], '已连接')
@@ -275,7 +385,7 @@ test('embedded settings accept only exact loopback parent/source; save is explic
   await tick()
   assert.equal(h.requests[0].resolved, 'http://localhost:3081/api/dsh-server-hub/remote/config')
   assert.equal(h.requests[0].options.credentials, 'same-origin')
-  assert.match(text(h.modal()), /执行端 :3081 接受主控 :3080/)
+  assert.match(text(h.modal()), /远程 :3081 接受主控 :3080/)
   nodes(h.modal()).find(node => node.type === 'input').props.onChange({ target: { checked: true } })
   assert.equal(h.requests.length, 1)
   await button(h.modal(), '保存工作区').props.onClick()
@@ -311,7 +421,7 @@ test('selected target shows direction; explicit settings click bridges locally a
   await h.mountMonitor()
   const { frames, children } = registerFrames(h)
   await openWorker(h)
-  assert.match(text(h.modal()), /执行端 :3081 接受主控 :3080/)
+  assert.match(text(h.modal()), /远程 :3081 接受主控 :3080/)
   assert.ok(children.every(child => child.sent.length === 0))
   const reads = h.requests.length
   button(h.modal(), '选择可执行工作区').props.onClick()
@@ -325,7 +435,7 @@ test('selected target shows direction; explicit settings click bridges locally a
   assert.equal(text(h.panel()), initial)
   h.message(children[1], 'http://localhost:3081', SAVED)
   await tick()
-  assert.match(text(h.modal()), /执行端工作区已保存/)
+  assert.match(text(h.modal()), /远程工作区已保存/)
   assert.equal(h.requests.filter(request => request.options.method === 'POST').length, 0)
   frames[1].props.ref(null)
   const after = text(h.panel())
@@ -339,11 +449,11 @@ test('connect is explicit same-origin POST; shows connected rather than disabled
   Object.defineProperty(h.win.document, 'cookie', { get() { throw new Error('cookie reads forbidden') } })
   await h.mountMonitor(); registerFrames(h); await openWorker(h)
   assert.equal(h.requests.filter(request => request.options.method === 'POST').length, 0)
-  await button(h.modal(), '连接执行端 :3081').props.onClick()
+  await button(h.modal(), '连接远程 :3081').props.onClick()
   const request = h.requests.at(-1)
   assert.equal(request.url, 'api/dsh-server-hub/remote/connections')
   assert.equal(request.options.method, 'POST'); assert.equal(request.options.credentials, 'same-origin')
-  assert.deepEqual(JSON.parse(request.options.body), { endpoint: 'http://localhost:3081/' })
+  assert.deepEqual(JSON.parse(request.options.body), { endpoint: 'http://localhost:3081/', name: '' })
   assert.match(text(h.modal()), /SR project/)
   assert.match(text(h.modal()), /已连接/)
   assert.doesNotMatch(text(h.modal()), /远控未启用|登录/)
@@ -357,13 +467,13 @@ test('connect is explicit same-origin POST; shows connected rather than disabled
 
 test('listing is once per open/refresh with no remote polling and no model/session side effects', async () => {
   const h = await harness()
-  await button(h.panel(), '执行端管理').props.onClick()
-  assert.deepEqual(h.requests.map(request => request.url), ['api/dsh-server-hub/remote/connections', 'api/dsh-server-hub/remote/activity'])
+  await button(h.panel(), '远程管理').props.onClick()
+  assert.deepEqual(h.requests.map(request => request.url), ['api/dsh-server-hub/remote/config', 'api/dsh-server-hub/remote/connections', 'api/dsh-server-hub/remote/activity'])
   assert.match(text(h.modal()), /Check CPU · running/)
   assert.equal(h.intervals.size, 0)
-  await tick(); assert.equal(h.requests.length, 2)
+  await tick(); assert.equal(h.requests.length, 3)
   await button(h.modal(), '刷新').props.onClick()
-  assert.equal(h.requests.length, 4)
+  assert.equal(h.requests.length, 6)
   assert.ok(h.requests.every(request => request.options.method === 'GET'))
   h.cleanup()
 })
@@ -375,13 +485,13 @@ test('proxy page preserves Hub/local settings but does not generate/reuse remote
   await openWorker(h)
   assert.equal(h.requests.length, 1)
   assert.match(text(h.modal()), /loopback/)
-  assert.equal(button(h.modal(), '连接执行端 :3081').props.disabled, true)
+  assert.equal(button(h.modal(), '连接远程 :3081').props.disabled, true)
   assert.ok(children.every(child => child.sent.length === 0)); h.cleanup()
 })
 
 test('HTTP 400 displays specific safe connection causes, not a generic status or private error body', async () => {
   for (const [code, pattern] of [
-    ['REMOTE_DISABLED', /执行端尚未开放工作区/], ['REMOTE_WORKSPACES_EMPTY', /至少勾选/],
+    ['REMOTE_DISABLED', /远程尚未开放工作区/], ['REMOTE_WORKSPACES_EMPTY', /至少勾选/],
     ['REMOTE_LOGIN_REQUIRED', /访问许可/], ['REMOTE_HOSTNAME', /主机名不一致/], ['REMOTE_STORAGE', /无法保存连接信息/],
   ]) {
     const h = await harness({ fetch: async (url, options) => options.method === 'POST'
@@ -389,7 +499,7 @@ test('HTTP 400 displays specific safe connection causes, not a generic status or
       : { ok: true, status: 200, json: async () => url.includes('/overview') ? overview : url.endsWith('/connections') ? { connections: [] } : { runs: [] } } })
     await h.mountMonitor(); registerFrames(h); await openWorker(h)
     const count = h.requests.length
-    await button(h.modal(), '连接执行端 :3081').props.onClick()
+    await button(h.modal(), '连接远程 :3081').props.onClick()
     assert.match(text(h.modal()), pattern)
     assert.doesNotMatch(text(h.modal()), /private|v1\.secret/)
     assert.equal(h.requests.length, count + 1, 'never automatically retry a failed POST')
@@ -399,7 +509,7 @@ test('HTTP 400 displays specific safe connection causes, not a generic status or
 
 test('upstream status and unknown/HTML errors never expose arbitrary server response text', async () => {
   for (const [failure, pattern] of [
-    [{ code: 'REMOTE_HTTP', remoteStatus: 403, error: 'private v1.secret' }, /执行端接口返回 HTTP 403/],
+    [{ code: 'REMOTE_HTTP', remoteStatus: 403, error: 'private v1.secret' }, /远程接口返回 HTTP 403/],
     [{ code: 'UNKNOWN_ERROR', error: 'private v1.secret' }, /HTTP 400/],
     [null, /HTTP 400/],
   ]) {
@@ -407,9 +517,9 @@ test('upstream status and unknown/HTML errors never expose arbitrary server resp
       ? { ok: false, status: 400, json: async () => { if (!failure) throw new Error('HTML response'); return failure } }
       : { ok: true, status: 200, json: async () => url.includes('/overview') ? overview : url.endsWith('/connections') ? { connections: [] } : { runs: [] } } })
     await h.mountMonitor(); registerFrames(h); await openWorker(h)
-    await button(h.modal(), '连接执行端 :3081').props.onClick()
+    await button(h.modal(), '连接远程 :3081').props.onClick()
     assert.match(text(h.modal()), pattern)
-    assert.doesNotMatch(text(h.modal()), /private|v1\.secret|正在将执行端/)
+    assert.doesNotMatch(text(h.modal()), /private|v1\.secret|正在将远程/)
     h.cleanup()
   }
 })
@@ -417,7 +527,7 @@ test('upstream status and unknown/HTML errors never expose arbitrary server resp
 test('401 and missing service 404 have distinct actionable messages', async () => {
   for (const [status, pattern] of [[401, /访问许可/], [404, /远控服务未加载（HTTP 404）.*pending\/failed.*重启/]]) {
     const h = await harness({ fetch: async () => ({ ok: false, status }) })
-    await button(h.panel(), '执行端管理').props.onClick()
+    await button(h.panel(), '远程管理').props.onClick()
     assert.match(text(h.modal()), pattern)
     assert.equal(nodes(h.modal()).some(node => node.type === 'button' && text(node) === '保存工作区'), false)
     assert.ok(h.requests.every(request => request.options.method === 'GET')); h.cleanup()

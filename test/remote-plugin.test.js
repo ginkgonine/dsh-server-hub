@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto'
 import { EventEmitter, once } from 'node:events'
 import { readFile } from 'node:fs/promises'
 import { apply, inject } from '../src/remote/index.js'
+import { RemoteStore } from '../src/remote/store.js'
 
 test('Cordis injection metadata names services directly, not required/optional pseudo-services', () => {
   assert.ok(Array.isArray(inject))
@@ -90,6 +91,7 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
         else {
           const agent = agents.get(input.sessionId)
           agent.status = 'running'; agent.events.push({ type: 'turn/start', data: { turn: 1 } })
+          notices.emit('worker-prompt', input)
         }
         return { accepted: true }
       },
@@ -138,7 +140,7 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
       { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
     agent.status = 'idle'; agent.idle.resolve()
   }
-  return { ctx, runtime, tools, providers, cookie, endpoint, request, finish, prompts, notices, creates, credentials, agents }
+  return { ctx, runtime, tools, providers, cookie, endpoint, request, finish, prompts, notices, creates, credentials, agents, units }
 }
 
 test('actual Cordis activates routes/tools and removes them on disposal', { skip: !process.env.DSH_TEST_CORDIS }, async t => {
@@ -214,7 +216,7 @@ test('remote execution starts off; config exposes registered workspaces, never a
 
 test('every route including SSE and config mutations requires native DSH admission', async t => {
   const f = await fixture(t)
-  for (const [path, method, input] of [['/catalog', 'GET'], ['/config', 'PUT', { enabled: true, workspaceIds: ['system'] }], ['/runs/r1/events', 'GET'], ['/connections', 'POST', { endpoint: f.endpoint }]]) {
+  for (const [path, method, input] of [['/catalog', 'GET'], ['/config', 'PUT', { enabled: true, workspaceIds: ['system'] }], ['/config', 'PUT', { waitForResult: true }], ['/connections/remote-0123456789abcdef01234567', 'PUT', { name: '197服务器' }], ['/runs/r1/events', 'GET'], ['/connections', 'POST', { endpoint: f.endpoint }]]) {
     assert.equal((await f.request(path, { method, input, cookies: '' })).status, 401)
     assert.equal((await f.request(path, { method, input, origin: 'https://untrusted.example' })).status, 403)
   }
@@ -251,6 +253,88 @@ test('explicit existing-login connection and native one-shot provider report fin
   await main.runtime.controller.report(await main.runtime.store.get('masters', submit.runId))
   assert.equal(main.prompts.length, 1)
   assert.equal(worker.prompts.length, 1)
+})
+
+test('single-turn config persists independently of workspace changes and migrates old snapshots', async t => {
+  const f = await fixture(t)
+  assert.equal((await f.request('/config')).value.waitForResult, false)
+  assert.equal((await f.request('/config', { method: 'PUT', input: { waitForResult: true } })).status, 200)
+  await f.request('/config', { method: 'PUT', input: { enabled: true, workspaceIds: ['system'] } })
+  assert.equal((await f.request('/config')).value.waitForResult, true)
+  const reopened = await RemoteStore.open(f.ctx)
+  t.after(() => reopened.close())
+  assert.equal(reopened.getConfig().waitForResult, true)
+  assert.deepEqual(reopened.getConfig().workspaceIds, ['system'])
+  for (const input of [{}, { waitForResult: 'true' }, { enabled: true }, { workspaceIds: ['system'] }, { waitForResult: true, extra: 1 }]) {
+    assert.equal((await f.request('/config', { method: 'PUT', input })).status, 400)
+  }
+  const state = f.units.values().next().value
+  delete state.global.waitForResult
+  const legacy = await RemoteStore.open(f.ctx)
+  t.after(() => legacy.close())
+  assert.equal(legacy.getConfig().waitForResult, false)
+  assert.deepEqual(legacy.getConfig().workspaceIds, ['system'])
+})
+
+test('single-turn switch overrides explicit background and returns remote output without queuing another parent turn', async t => {
+  const { main, worker, connection } = await connected(t)
+  await main.request('/config', { method: 'PUT', input: { waitForResult: true } })
+  const started = once(worker.notices, 'worker-prompt')
+  let settled = false
+  const result = main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: 'Check', prompt: 'inspect', run_in_background: true },
+    { agent: { id: 'parent-1' }, callId: 'wait-1', signal: new AbortController().signal }).then(value => { settled = true; return value })
+  await bounded(started)
+  assert.equal(settled, false, 'current tool call must remain waiting')
+  assert.equal(main.prompts.length, 0)
+  await main.request('/config', { method: 'PUT', input: { waitForResult: false } })
+  worker.finish(worker.creates[0].sessionId, 'Training progress inspected')
+  const answer = await bounded(result)
+  assert.equal(answer.stopReason, 'completed')
+  assert.match(answer.output[0].text, /Training progress inspected/)
+  assert.equal(main.prompts.length, 0, 'no sessionController.prompt means no extra report turn')
+  assert.equal(worker.prompts.length, 1, 'no model polling during waiting')
+  assert.equal(main.runtime.store.get('masters', answer.runId).background, false)
+})
+
+test('delivery mode of an existing background task does not change when the single-turn setting changes', async t => {
+  const { main, worker, connection } = await connected(t)
+  const args = { targetId: connection.targetId, workspaceId: 'system', description: 'Check', prompt: 'inspect', idempotencyKey: 'same-mode' }
+  const exec = { agent: { id: 'parent-1' }, callId: 'bg-1', signal: new AbortController().signal }
+  const first = await main.tools.get('remote_agent').execute(args, exec)
+  await main.request('/config', { method: 'PUT', input: { waitForResult: true } })
+  const retry = await bounded(main.tools.get('remote_agent').execute(args, exec))
+  assert.equal(retry.accepted, true)
+  assert.equal(retry.runId, first.runId)
+  assert.equal(worker.creates.length, 1)
+  const report = once(main.notices, 'report')
+  worker.finish(worker.creates[0].sessionId)
+  await bounded(report)
+  assert.equal(main.prompts.length, 1)
+})
+
+test('name updates need only main admission and are visible to target lookup without reconnecting or dispatching', async t => {
+  const { main, worker, connection } = await connected(t)
+  const before = structuredClone([...main.credentials.values()])
+  const path = `/connections/${connection.targetId}`
+  let rename = await main.request(path, { method: 'PUT', input: { name: '197服务器' } })
+  assert.equal(rename.status, 200)
+  assert.equal(rename.value.connection.name, '197服务器')
+  assert.equal(rename.value.connection.targetId, connection.targetId)
+  let targets = await main.tools.get('remote_agent_targets').execute({}, { agent: { id: 'parent-1' } })
+  assert.equal(targets.targets[0].name, '197服务器')
+  const current = [...main.credentials.values()][0]
+  assert.equal(current.payload.cookieValue, before[0].payload.cookieValue)
+  rename = await main.request(path, { method: 'PUT', input: { name: 'old browser', onlyIfUnset: true } })
+  assert.equal(rename.value.connection.name, '197服务器')
+  assert.equal((await main.request(path, { method: 'PUT', input: { name: '', onlyIfUnset: 'true' } })).status, 400)
+  assert.equal((await main.request(path, { method: 'PUT', input: { name: 'x', endpoint: worker.endpoint } })).status, 400)
+  main.runtime.connections.fetchImpl = async () => { throw new Error('offline') }
+  targets = await main.tools.get('remote_agent_targets').execute({}, { agent: { id: 'parent-1' } })
+  assert.equal(targets.targets[0].online, false)
+  assert.equal(targets.targets[0].name, '197服务器')
+  assert.equal(main.creates.length, 0)
+  assert.equal(worker.creates.length, 0)
+  assert.equal(JSON.stringify(rename.value).includes('v1.a.b'), false)
 })
 
 test('same task identity deduplicates at both ends; revoked workspace cannot start new work', async t => {

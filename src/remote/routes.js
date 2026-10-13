@@ -29,8 +29,12 @@ export function createRemoteRoute({ ctx, store, connections, worker, controller 
       if (req.method === 'GET' && path === '/config') return send(res, 200, envelope(settings()))
       if (req.method === 'PUT' && path === '/config') {
         const input = await body(req)
-        if (!input || Object.keys(input).some(key => !['enabled', 'workspaceIds'].includes(key)) || typeof input.enabled !== 'boolean' ||
-          !Array.isArray(input.workspaceIds) || input.workspaceIds.length > 256 || input.workspaceIds.some(id => typeof id !== 'string' || !ctx.workspaceRegistry.get(id))) throw new Error('请选择已注册的工作区')
+        if (!input || Array.isArray(input) || !Object.keys(input).length || Object.keys(input).some(key => !['enabled', 'workspaceIds', 'waitForResult'].includes(key))) throw new Error('无效的远控设置')
+        if (Object.hasOwn(input, 'waitForResult') && typeof input.waitForResult !== 'boolean') throw new Error('请选择单轮回复模式')
+        if (Object.hasOwn(input, 'enabled') || Object.hasOwn(input, 'workspaceIds')) {
+          if (typeof input.enabled !== 'boolean' || !Array.isArray(input.workspaceIds) || input.workspaceIds.length > 256 ||
+            input.workspaceIds.some(id => typeof id !== 'string' || !ctx.workspaceRegistry.get(id))) throw new Error('请选择已注册的工作区')
+        }
         await store.setConfig(input)
         return send(res, 200, envelope(settings()))
       }
@@ -41,11 +45,17 @@ export function createRemoteRoute({ ctx, store, connections, worker, controller 
       if (req.method === 'GET' && path === '/connections') return send(res, 200, envelope({ connections: await connections.list() }))
       if (req.method === 'POST' && path === '/connections') {
         const input = await body(req)
-        if (!input || Object.keys(input).length !== 1 || typeof input.endpoint !== 'string') throw new Error('请选择 Hub 中的目标实例')
-        if (new URL(input.endpoint).port === String(ctx.webServer.port)) throw Object.assign(new Error('这是主控本机，无需连接自己；请在 Hub 中选择另一个执行端。'), { code: 'REMOTE_SELF' })
+        if (!input || Object.keys(input).some(key => !['endpoint', 'name'].includes(key)) || typeof input.endpoint !== 'string') throw new Error('请选择 Hub 中的目标实例')
+        if (new URL(input.endpoint).port === String(ctx.webServer.port)) throw Object.assign(new Error('这是主控本机，无需连接自己；请在 Hub 中选择另一个远程。'), { code: 'REMOTE_SELF' })
         return send(res, 200, envelope({ connection: await connections.connect(req, input) }))
       }
       const connection = path.match(/^\/connections\/(remote-[a-f0-9]{24})$/)
+      if (req.method === 'PUT' && connection) {
+        const input = await body(req)
+        if (!input || Object.keys(input).some(key => !['name', 'onlyIfUnset'].includes(key)) || !Object.hasOwn(input, 'name') ||
+          (Object.hasOwn(input, 'onlyIfUnset') && typeof input.onlyIfUnset !== 'boolean')) throw new Error('请提供远程名称')
+        return send(res, 200, envelope({ connection: await connections.rename(connection[1], input.name, { onlyIfUnset: input.onlyIfUnset === true }) }))
+      }
       if (req.method === 'DELETE' && connection) return send(res, 200, envelope(await connections.forget(connection[1])))
       if (req.method === 'POST' && path === '/runs') return send(res, 202, envelope({ run: await worker.start(await body(req)) }))
       const run = path.match(/^\/runs\/([a-zA-Z0-9][a-zA-Z0-9_.-]{0,127})(\/(?:events|interrupt|drain))?$/)
