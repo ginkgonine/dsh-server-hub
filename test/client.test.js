@@ -7,7 +7,12 @@ async function loadClientModule() {
   let definition
   const localStorage = new Map()
   const windowStub = {
-    document: { title: 'DeepSeek Harness' },
+    document: {
+      title: 'DeepSeek Harness', baseURI: 'http://127.0.0.1:3080/', referrer: '',
+      createElement: () => ({ dataset: {}, remove() {} }), head: { appendChild() {} },
+    },
+    addEventListener() {},
+    removeEventListener() {},
     localStorage: {
       getItem(key) { return localStorage.has(key) ? localStorage.get(key) : null },
       setItem(key, value) { localStorage.set(key, String(value)) },
@@ -41,13 +46,20 @@ test('exports a top-level Hub client package', async () => {
   assert.equal(typeof client.apply, 'function')
 })
 
-test('embedded remote pages skip the Hub UI', async () => {
+test('embedded remote pages register only the settings bridge and overlay, without the Hub UI', async () => {
   const { client, windowStub } = await loadClientModule()
   windowStub.parent = {}
+  const labels = []
+  const registered = []
   client.apply({
-    effect() { throw new Error('embedded mode must not register effects') },
-    slots: { inject() { throw new Error('embedded mode must not register slots') } },
+    effect(callback, label) { labels.push(label); return callback() },
+    slots: {
+      inject(name, callback) { assert.equal(name, 'shell.overlay'); callback() },
+      register(options) { registered.push(options.id); return () => {} },
+    },
   })
+  assert.deepEqual(registered, ['dsh-server-hub-remote-settings'])
+  assert.deepEqual(labels, ['dsh-server-hub: remote settings bridge', 'dsh-server-hub: styles'])
 })
 
 test('registers compatible slots and polls within root and proxy mounts', async () => {
@@ -76,7 +88,7 @@ test('registers compatible slots and polls within root and proxy mounts', async 
         register(options, component) { slots.set(options.name, { options, component }); return () => {} },
       },
     })
-    assert.deepEqual(injected, ['shell.overlay', 'sidebar.panellist', 'main'])
+    assert.deepEqual(injected, ['shell.overlay', 'shell.overlay', 'sidebar.panellist', 'main'])
     assert.equal(slots.get('main').options.key, slots.get('sidebar.panellist').options.id)
     const monitor = slots.get('shell.overlay').component()
     monitor.type(monitor.props)

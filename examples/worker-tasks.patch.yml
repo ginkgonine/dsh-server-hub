@@ -1,0 +1,31 @@
+# Existing Linux worker DSH/container: no nested/new container required.
+# Apply as an additional DSH --patch overlay, or append this row to your profile patch.
+# Configure trusted existing paths, preset and credentials before enabling.
+- id: dsh-server-hub-tasks
+  disabled: true
+  config:
+    enabled: false
+    nodeId: v100
+    token: REPLACE_WITH_RANDOM_64_HEX_TOKEN
+    stateDirectory: /absolute/private/state/hub-worker
+    projects:
+      - id: sr
+        root: /absolute/existing/project/SR
+        agentPreset: YOUR_REGISTERED_AGENT_PRESET_ID
+        mode: workspace-write
+        approvalPolicy: ask
+        allowPartial: false
+        resources: [gpu-v100]
+        stepLimit: 20
+        activeTimeoutMs: 600000
+    # OPTIONAL advanced persistent execution. Do not enable solely because paths
+    # are chmod 0700: the Agent must NOT be able to read or modify key/control state.
+    # supervisor:
+    #   stateDirectory: /absolute/private/state/hub-executions
+    #   secretFile: /absolute/private/state/hub-executor.key
+    #   controlBoundaryVerified: true
+    #   allowPartial: false
+    #   environment:
+    #     PATH: /usr/local/bin:/usr/bin:/bin
+    #     LANG: C.UTF-8
+    #     CUDA_VISIBLE_DEVICES: "0"

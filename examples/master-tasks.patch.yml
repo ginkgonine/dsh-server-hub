@@ -1,0 +1,12 @@
+# Apply as an additional DSH --patch overlay, or append this row to your profile patch.
+# Both switches are OFF. Configure every value before enabling.
+- id: dsh-server-hub-tasks
+  disabled: true
+  config:
+    enabled: false
+    stateDirectory: /absolute/private/state/hub-master
+    nodes:
+      - nodeId: v100
+        endpoint: http://127.0.0.1:3101/
+        token: REPLACE_WITH_RANDOM_64_HEX_TOKEN
+        projects: [sr]
