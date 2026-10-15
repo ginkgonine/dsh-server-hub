@@ -15,21 +15,29 @@ test('native interaction serialization projects a detached whitelist, never Agen
   request.questions[0].extra = cycle
   request.questions[0].options[0].secret = cycle
   const projected = wire('questions', request)
-  assert.deepEqual(projected, { id: 'request-1', createdAt: 1, kind: 'questions', requiresHuman: false, ...questions() })
+  assert.deepEqual(projected, { id: 'request-1', createdAt: 1, kind: 'questions', ...questions() })
   projected.questions[0].question = 'changed'
   assert.equal(request.questions[0].question, 'Choose a mode')
   assert.deepEqual(wire('approval', { ...approval(), agent: cycle, command: cycle }),
-    { id: 'request-1', createdAt: 1, kind: 'approval', requiresHuman: true, ...approval() })
+    { id: 'request-1', createdAt: 1, kind: 'approval', ...approval() })
 })
 
-test('wire snapshots enforce exact keys, unique IDs, derived human flags and aggregate bounds', () => {
+test('wire snapshots enforce exact keys, unique IDs and aggregate bounds while ignoring legacy human flags', () => {
   const original = [wire('questions', questions())]
   assert.deepEqual(normalizeInteractions(undefined), [])
   const normalized = normalizeInteractions(original)
   normalized[0].questions[0].options[0].label = 'changed'
   assert.equal(original[0].questions[0].options[0].label, 'Safe')
   bad(() => normalizeInteractions([{ ...original[0], signal: {} }]))
-  bad(() => normalizeInteractions([{ ...original[0], requiresHuman: true }]))
+  for (const requiresHuman of [false, true]) {
+    assert.deepEqual(normalizeInteractions([{ ...original[0], requiresHuman }]), original)
+    const request = wire('approval', approval())
+    const [normalizedApproval] = normalizeInteractions([{ ...request, requiresHuman }])
+    assert.deepEqual(normalizedApproval, request)
+    assert.equal(validateInteractionResponse(normalizedApproval, { outcome: 'allowed-once' }), 'allowed-once')
+  }
+  bad(() => normalizeInteractions([{ ...original[0], requiresHuman: 'true' }]))
+  bad(() => normalizeInteractions([{ ...original[0], requiresHuman: null }]))
   bad(() => normalizeInteractions([original[0], original[0]]))
   bad(() => normalizeInteractions(Array.from({ length: 9 }, (_, index) => ({ ...original[0], id: `request-${index}` }))))
   bad(() => normalizeInteractions([{ ...original[0], questions: [{ ...original[0].questions[0], injected: 'data' }] }]))
@@ -50,22 +58,28 @@ test('invalid/oversized text, duplicate stable identifiers and labels are reject
   assert.deepEqual(validateInteractionResponse(projected, { answers: [{ id, selected: [label] }] }), { answers: [{ id, selected: [label] }] })
 })
 
-test('approval and intent-bearing questions require explicit internal human capability', () => {
+test('approval decisions and plan-review answers accept ordinary controller replies without a human capability', () => {
   const request = wire('approval', approval())
+  assert.equal('requiresHuman' in request, false)
   for (const outcome of ['allowed-once', 'rejected', 'cancelled', 'unavailable']) {
-    assert.throws(() => validateInteractionResponse(request, { outcome }), { code: 'REMOTE_HUMAN_REQUIRED' })
-    assert.equal(validateInteractionResponse(request, { outcome }, { human: true }), outcome)
+    assert.equal(validateInteractionResponse(request, { outcome }), outcome)
   }
-  assert.throws(() => validateInteractionResponse(request, { outcome: 'allowed-once' }, { human: 'true' }), { code: 'REMOTE_HUMAN_REQUIRED' })
-  bad(() => validateInteractionResponse(request, { outcome: 'always' }, { human: true }))
-  bad(() => validateInteractionResponse(request, { outcome: 'allowed-once', human: true }, { human: true }))
+  bad(() => validateInteractionResponse(request, { outcome: 'always' }))
+  bad(() => validateInteractionResponse(request, { outcome: 'allowed-once', human: true }))
   const review = questions()
   review.questions[0].intent = { kind: 'plan-review', approve: 'Safe', callId: 'remote-call' }
   const plan = wire('questions', review)
-  assert.equal(plan.requiresHuman, true)
+  assert.equal('requiresHuman' in plan, false)
   assert.deepEqual(plan.questions[0].intent, review.questions[0].intent)
-  assert.throws(() => validateInteractionResponse(plan, input()), { code: 'REMOTE_HUMAN_REQUIRED' })
-  assert.deepEqual(validateInteractionResponse(plan, input(), { human: true }), input())
+  for (const selected of [['Safe'], ['Fast']]) {
+    const response = { answers: [{ id: 'choice', selected }] }
+    assert.deepEqual(validateInteractionResponse(plan, response), response)
+    for (const requiresHuman of [false, true]) {
+      const [normalized] = normalizeInteractions([{ ...plan, requiresHuman }])
+      assert.deepEqual(normalized, plan)
+      assert.deepEqual(validateInteractionResponse(normalized, response), response)
+    }
+  }
   bad(() => wire('questions', { questions: [{ ...review.questions[0], intent: { kind: 'plan-review', approve: 'missing' } }] }))
 })
 

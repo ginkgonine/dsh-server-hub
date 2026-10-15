@@ -23,7 +23,7 @@ const MAX_RESPONSE_RECEIPTS = 256
 
 /** One remote request owns one ordinary, independent worker conversation.
  * Its real interaction waterfalls are claimed by this worker and answered by
- * the controlling human/Hub, never by a fabricated Agent or a new prompt.
+ * the owning controller's reply, resuming the same remote tool call.
  */
 export class RemoteWorker {
   constructor(ctx, store, { getConfig } = {}) {
@@ -268,7 +268,7 @@ export class RemoteWorker {
   }
 
   /** Resume exactly one original waterfall, never create or prompt an Agent. */
-  async respond(runId, requestId, input, { human = false } = {}) {
+  async respond(runId, requestId, input) {
     id(runId, 'runId'); id(requestId, 'requestId')
     await this.initialize()
     return this.serial(async () => {
@@ -276,7 +276,7 @@ export class RemoteWorker {
       if (!record) throw problem('REMOTE_NOT_FOUND', 'Remote task does not exist')
       const receipt = record.responseReceipts?.[requestId]
       if (receipt) {
-        const native = validateInteractionResponse(receipt.interaction, input, { human })
+        const native = validateInteractionResponse(receipt.interaction, input)
         if (receipt.expired) throw problem('REMOTE_REQUEST_EXPIRED', 'Interaction is no longer pending')
         if (responseDigest(native) !== receipt.digest) throw problem('REMOTE_CONFLICT', 'Interaction already received a different response')
         return this.public(record)
@@ -284,7 +284,7 @@ export class RemoteWorker {
       const entry = this.live.get(runId)
       const pending = entry?.interactions.get(requestId)
       if (this.closed || !entry?.active || terminal.has(record.state) || !pending || pending.closed || pending.signal?.aborted) throw problem('REMOTE_REQUEST_EXPIRED', 'Interaction is no longer pending')
-      const native = validateInteractionResponse(pending.wire, input, { human })
+      const native = validateInteractionResponse(pending.wire, input)
       const requests = normalizeInteractions([...entry.interactions.values()].filter(item => item !== pending).map(item => item.wire))
       record = await this._write({ ...record, requests, state: this._interactionState(entry, requests),
         responseReceipts: { ...(record.responseReceipts || {}), [requestId]: { interaction: pending.wire, digest: responseDigest(native) } } })

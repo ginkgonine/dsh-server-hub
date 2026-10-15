@@ -6,7 +6,7 @@ window.__ModuleLoader__.load({
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
     const React = require('react')
 
-    const inject = ['slots', 'layout', 'uiSession']
+    const inject = ['slots', 'layout']
     const PANEL_ID = 'dsh-server-hub'
     const STORAGE_KEY = 'dsh-server-hub.preferences.v1'
     const NOTIFICATION_PREFIX = 'dsh-server-hub.notification.'
@@ -63,8 +63,6 @@ window.__ModuleLoader__.load({
       .dsh-hub-frame { position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%; border: 0; display: block; opacity: 0; pointer-events: none; background: var(--dsw-alias-bg-base, Canvas); color-scheme: inherit; transform: translateZ(0); will-change: opacity; transition: opacity 160ms cubic-bezier(.2, .7, .2, 1); }
       .dsh-hub-frame.is-active { z-index: 1; opacity: 1; pointer-events: auto; }
       .dsh-hub-remote-backdrop { position: fixed; inset: 0; z-index: 10000; display: grid; place-items: center; padding: 20px; background: rgb(0 0 0 / .42); color: var(--dsw-alias-label-primary, CanvasText); }
-      .dsh-hub-remote-attention { position: fixed; right: 20px; bottom: 20px; z-index: 9999; max-width: min(420px, calc(100vw - 40px)); padding: 12px 16px; border: 1px solid #e2a12c; border-radius: 10px; color: var(--dsw-alias-label-primary, CanvasText); background: var(--dsw-alias-bg-base, Canvas); box-shadow: 0 4px 24px rgb(0 0 0 / .2); }
-      .dsh-hub-remote-attention p { margin: 0 0 8px; font-size: 12px; }
       .dsh-hub-remote-modal { width: min(520px, 100%); max-height: 85vh; overflow: auto; border-radius: 12px; padding: 22px; background: var(--dsw-alias-bg-base, Canvas); box-shadow: 0 12px 48px rgb(0 0 0 / .25); }
       .dsh-hub-remote-modal h2 { margin: 0 0 12px; font-size: 17px; }
       .dsh-hub-remote-description { font-size: 12px; line-height: 1.6; opacity: .75; }
@@ -74,10 +72,6 @@ window.__ModuleLoader__.load({
       .dsh-hub-remote-error { color: #d96464; font-size: 12px; overflow-wrap: anywhere; }
       .dsh-hub-remote-target { margin: 12px 0; padding: 12px; border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 8px; font-size: 12px; }
       .dsh-hub-remote-target ul { padding-left: 20px; }
-      .dsh-hub-chat-interaction { padding: 8px calc(var(--dsh-composer-side-clearance, 0px) + 16px) 12px; }
-      .dsh-hub-chat-interaction > article { box-sizing: border-box; width: 100%; max-width: var(--dsh-chat-content-width, 800px); max-height: 55vh; overflow: auto; margin: 0 auto; padding: 16px; border-color: var(--dsw-alias-state-warn-secondary, #e2a12c); background: var(--dsw-specific-input-major, Canvas); border-radius: 12px; box-shadow: var(--dsw-shadow-lv2, 0 4px 24px rgb(0 0 0 / .12)); }
-      .dsh-hub-chat-interaction button { margin: 8px 8px 0 0; }
-      .dsh-hub-chat-interaction textarea { display: block; box-sizing: border-box; width: 100%; min-height: 64px; color: inherit; background: transparent; }
       .dsh-hub-loading { position: absolute; inset: 0; z-index: 2; display: grid; place-items: center; color: var(--dsw-alias-label-secondary, currentColor); background: var(--dsw-alias-bg-base, Canvas); opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 180ms ease, visibility 0s linear 180ms; }
       .dsh-hub-loading.is-visible { opacity: 1; visibility: visible; transition-delay: 0s; }
       .dsh-hub-loading-card { display: flex; align-items: center; gap: 9px; font-size: 12px; opacity: .72; }
@@ -381,7 +375,6 @@ window.__ModuleLoader__.load({
 
     function HubMonitor(props) {
       const snapshot = useHubSnapshot()
-      const remote = useRemoteSnapshot()
 
       React.useEffect(() => {
         let disposed = false
@@ -451,20 +444,8 @@ window.__ModuleLoader__.load({
         }
         void refresh(false)
         const interval = window.setInterval(() => { void refresh(false) }, POLL_MS)
-        // Read the controller's local journal even when Hub/manager is closed.
-        // This never polls a model or creates a remote task/approval decision.
-        monitoringInteractions = remoteControlAvailable()
-        if (monitoringInteractions) void refreshInteractions(remoteEpoch, true)
-        const activityInterval = monitoringInteractions
-          ? window.setInterval(() => { void refreshInteractions(remoteEpoch, true) }, 3000) : null
         return () => {
           disposed = true
-          monitoringInteractions = false
-          activityGeneration += 1
-          interactionAbort?.abort()
-          interactionAbort = null
-          refreshingInteractions = false
-          if (activityInterval !== null) window.clearInterval(activityInterval)
           connectionsRevision += 1
           requestOverviewRefresh = async () => {}
           notificationOpen = () => {}
@@ -485,14 +466,7 @@ window.__ModuleLoader__.load({
         return () => window.clearInterval(interval)
       }, [snapshot])
 
-      const waiting = pendingRuns(remote).filter(run => run.scope !== 'controller' || !run.originSessionId || !(run.requests || []).length)
-      const count = waiting.reduce((total, run) => total + Math.max(1, (run.requests || []).length), 0)
-      if ((!count && !remote.activityError) || remote.kind) return null
-      return React.createElement('aside', { className: 'dsh-hub-remote-attention', role: 'status', 'aria-live': 'polite' },
-        count ? React.createElement('p', null, `远程任务有 ${count} 项审批／回复待处理；任务正在等待你操作。`) : null,
-        remote.activityError ? React.createElement('p', null, count ? '状态更新失败，显示上次记录；请检查连接后刷新。' : '无法读取远程请求，可能有审批正在等待；请打开远程管理检查。') : null,
-        React.createElement('button', { type: 'button', className: 'dsh-hub-action', onClick: () => openRemotePanel() }, count ? `处理远程请求（${count}）` : '检查远程请求'),
-      )
+      return null
     }
 
     const childFrames = new Map()
@@ -512,7 +486,6 @@ window.__ModuleLoader__.load({
       REMOTE_STORAGE: '主控无法保存连接信息，请检查 DSH 私有凭据存储是否可写。',
       REMOTE_NAME: '名称需为不超过 40 个字符的文本，不能包含控制字符。',
       REMOTE_REQUEST_EXPIRED: '此请求已撤回、取消或结束，请刷新查看最新状态。',
-      REMOTE_HUMAN_REQUIRED: '此请求需要你亲自回复，Agent 不能代为审批。',
       REMOTE_CONFLICT: '此请求已经收到不同回复，请刷新确认，勿重复提交。',
       REMOTE_INPUT: '回复格式无效，请完成每个问题并核对可选项。',
       REMOTE_NOT_FOUND: '原任务不存在，请刷新确认；不会重新派单。',
@@ -521,197 +494,6 @@ window.__ModuleLoader__.load({
       REMOTE_TRANSPORT: '主控无法访问远程，请检查端口或隧道是否可达，再手动重试。',
     }
     let remoteEpoch = 0
-    let interactionTimer = null
-    let monitoringInteractions = false
-    let refreshingInteractions = false
-    let interactionAbort = null
-    let activityGeneration = 0
-    const pendingRuns = snapshot => snapshot.runs.filter(run => !['completed', 'error', 'interrupted'].includes(run.state) &&
-      ((run.requests || []).length || ['waiting_input', 'waiting_approval'].includes(run.state)))
-    const interactionKey = (run, request) => `${run.scope || 'controller'}:${run.runId}:${request.id}`
-    let interactionDrafts = {}
-    let respondingInteraction = null
-
-    function stopInteractionRefresh() {
-      if (interactionTimer !== null) window.clearInterval(interactionTimer)
-      interactionTimer = null
-    }
-
-    async function refreshInteractions(epoch, background = false) {
-      if (refreshingInteractions || epoch !== remoteEpoch || (background ? !monitoringInteractions : remoteSnapshot.kind !== 'manager')) return
-      refreshingInteractions = true
-      const abort = new AbortController(), generation = ++activityGeneration
-      interactionAbort = abort
-      try {
-        const activity = await remoteRequest('/activity', { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(10000)]) })
-        if (!activity || !Array.isArray(activity.runs)) throw new Error('实例返回了无效的待处理请求列表')
-        if (generation === activityGeneration && epoch === remoteEpoch && (!background || monitoringInteractions)) {
-          const live = new Set(activity.runs.flatMap(run => (run.requests || []).map(request => interactionKey(run, request))))
-          interactionDrafts = Object.fromEntries(Object.entries(interactionDrafts).filter(([key]) => live.has(key)))
-          publishRemote({ runs: activity.runs, activityError: null })
-        }
-      } catch (error) {
-        if (generation === activityGeneration && epoch === remoteEpoch && (!background || monitoringInteractions)) publishRemote({ activityError: remoteError(error),
-          ...(remoteSnapshot.kind === 'manager' ? { error: remoteError(error) } : {}) })
-      } finally {
-        if (interactionAbort === abort) { interactionAbort = null; refreshingInteractions = false }
-      }
-    }
-
-    function startInteractionRefresh(epoch) {
-      stopInteractionRefresh()
-      // The shell monitor already refreshes the same local journal. Embedded
-      // settings have no monitor, so retain a panel-only fallback without duplicates.
-      if (!monitoringInteractions) interactionTimer = window.setInterval(() => { void refreshInteractions(epoch) }, 3000)
-    }
-
-    function editInteractionAnswer(run, request, question, patch) {
-      const key = interactionKey(run, request)
-      const draft = interactionDrafts[key] || {}
-      interactionDrafts = { ...interactionDrafts, [key]: { ...draft, [question.id]: { selected: [], custom: '', ...(Object.hasOwn(draft, question.id) ? draft[question.id] : undefined), ...patch } } }
-      publishRemote({})
-    }
-
-    async function sendInteractionResponse(run, request, response, { confirmGrant = true } = {}) {
-      if (respondingInteraction) return
-      if (confirmGrant && (response.outcome === 'allowed-once' || request.questions?.some(question => question.intent && response.answers?.some(answer => answer.id === question.id && answer.selected.includes(question.intent.approve)))) &&
-          !window.confirm(`确认允许远程任务「${run.description || run.runId}」继续？请核对显示的审批原因／计划；此操作不会永久放开权限。`)) return
-      const key = interactionKey(run, request), epoch = remoteEpoch
-      respondingInteraction = key
-      publishRemote({ error: null })
-      try {
-        const scope = run.scope === 'worker' ? 'runs' : 'delegated'
-        const reply = await remoteRequest(`/${scope}/${encodeURIComponent(run.runId)}/requests/${encodeURIComponent(request.id)}/response`, {
-          method: 'POST', body: { response, ...(scope === 'runs' ? { human: true } : {}) },
-        })
-        // A slow pre-response GET must not resurrect this answered request.
-        activityGeneration += 1
-        interactionAbort?.abort()
-        interactionAbort = null
-        refreshingInteractions = false
-        publishRemote({ runs: remoteSnapshot.runs.map(item => item.runId === run.runId && item.scope === run.scope
-          ? { ...item, ...(reply?.run || { requests: (item.requests || []).filter(value => value.id !== request.id) }), scope: item.scope } : item) })
-        if (epoch === remoteEpoch) {
-          delete interactionDrafts[key]
-          publishRemote({ notice: '回复已提交，原远程任务继续执行。' })
-          await refreshInteractions(epoch)
-        }
-      } catch (error) {
-        if (epoch === remoteEpoch) {
-          publishRemote({ error: `${remoteError(error)}；请确认原任务状态后再操作。` })
-          if (['REMOTE_REQUEST_EXPIRED', 'REMOTE_CONFLICT'].includes(error.code)) await refreshInteractions(epoch, monitoringInteractions)
-        }
-      } finally {
-        respondingInteraction = null
-        if (epoch === remoteEpoch) publishRemote({})
-      }
-    }
-
-    function interactionCard(run, request, snapshot, inChat = false) {
-      const connection = snapshot.connections.find(item => item.targetId === run.targetId)
-      const key = interactionKey(run, request)
-      const disabled = Boolean(respondingInteraction) || snapshot.loading
-      const draft = interactionDrafts[key] || {}
-      const answers = (request.questions || []).map(question => {
-        const value = (Object.hasOwn(draft, question.id) ? draft[question.id] : undefined) || { selected: [], custom: '' }
-        return { id: question.id, selected: value.selected, ...(value.custom.trim() ? { custom: value.custom } : {}) }
-      })
-      const complete = answers.every(answer => answer.selected.length || answer.custom?.trim())
-      return React.createElement('article', { key, className: 'dsh-hub-remote-target' },
-        React.createElement('strong', null, run.description || run.runId, request.kind === 'approval' ? ' · 等待人工审批' : ' · 等待回复'),
-        React.createElement('small', { style: { display: 'block' } }, connection ? `${connection.name || '远程'} · ${connection.endpoint}` : run.scope === 'worker' ? '本机接收的远程任务' : run.targetId || '远程任务'),
-        !inChat ? React.createElement('small', { style: { display: 'block' } }, run.runId) : null,
-        request.kind === 'approval' ? React.createElement('div', null,
-          React.createElement('p', null, `工具：${request.toolName}`),
-          React.createElement('p', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, request.displayReason?.['zh-CN'] || request.displayReason?.en || request.reason || '远程请求执行权限'),
-          !inChat ? React.createElement('p', { className: 'dsh-hub-remote-description' }, '审批只能由你处理，主控 Agent 不能代批。') : null,
-          React.createElement('button', { type: 'button', className: 'dsh-hub-action', disabled, onClick: () => sendInteractionResponse(run, request, { outcome: 'allowed-once' }, { confirmGrant: !inChat }) }, '允许一次'),
-          React.createElement('button', { type: 'button', className: 'dsh-hub-action', disabled, onClick: () => sendInteractionResponse(run, request, { outcome: 'rejected' }) }, '拒绝'),
-        ) : React.createElement('div', null,
-          (request.questions || []).map(question => {
-            const value = (Object.hasOwn(draft, question.id) ? draft[question.id] : undefined) || { selected: [], custom: '' }
-            return React.createElement('fieldset', { key: question.id, disabled },
-              React.createElement('legend', null, question.header || question.question),
-              question.header ? React.createElement('p', null, question.question) : null,
-              question.detail ? React.createElement('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, question.detail) : null,
-              (question.options || []).map(option => React.createElement('label', { key: option.label, className: 'dsh-hub-remote-workspace' },
-                React.createElement('input', { type: question.multiSelect ? 'checkbox' : 'radio', name: `${key}:${question.id}`, checked: value.selected.includes(option.label),
-                  onChange: event => editInteractionAnswer(run, request, question, { selected: question.multiSelect ? (event.target.checked ? [...new Set(value.selected.concat(option.label))] : value.selected.filter(label => label !== option.label)) : [option.label], ...(question.multiSelect ? {} : { custom: '' }) }) }),
-                React.createElement('span', null, option.label, option.description ? React.createElement('small', null, option.description) : null))),
-              React.createElement('textarea', { 'aria-label': `${question.question}（自定义回复）`, value: value.custom, placeholder: '或输入回复',
-                onChange: event => editInteractionAnswer(run, request, question, { custom: event.target.value, ...(question.multiSelect ? {} : { selected: [] }) }) }),
-            )
-          }),
-          request.requiresHuman ? React.createElement('p', { className: 'dsh-hub-remote-description' }, '计划审核需要你亲自确认。') : null,
-          React.createElement('button', { type: 'button', className: 'dsh-hub-action', disabled: disabled || !complete, onClick: () => sendInteractionResponse(run, request, { answers }, { confirmGrant: !inChat }) }, respondingInteraction === key ? '提交中…' : '提交回复'),
-        ),
-      )
-    }
-    // A dedicated pending-interaction domain puts remote requests in the same
-    // composer location as ask_user_question, including when the parent is idle.
-    // It is presentation only: a human click uses the authenticated response API.
-    class PendingRemoteInteraction {
-      constructor(run, request) {
-        this.key = `hub-remote:${interactionKey(run, request)}`
-        this.kind = 'hub-remote'
-        this.sessionId = run.originSessionId
-        this.runId = run.runId
-        this.requestId = request.id
-      }
-    }
-
-    function RemoteChatInteraction(props) {
-      const snapshot = useRemoteSnapshot(), pending = props.matched
-      const run = pendingRuns(snapshot).find(run => run.scope === 'controller' && run.runId === pending.runId && run.originSessionId === props.sessionId)
-      const request = run?.requests?.find(request => request.id === pending.requestId && !run.nativeRequestIds?.includes(request.id))
-      if (!request) return null
-      const count = pendingRuns(snapshot).filter(run => run.scope === 'controller' && run.originSessionId === props.sessionId)
-        .reduce((total, run) => total + (run.requests || []).filter(request => !run.nativeRequestIds?.includes(request.id)).length, 0)
-      return React.createElement('section', { className: 'dsh-hub-chat-interaction', 'aria-label': '远程任务审批与提问', 'aria-busy': Boolean(respondingInteraction) },
-        interactionCard(run, request, snapshot, true),
-        count > 1 ? React.createElement('p', { className: 'dsh-hub-remote-description' }, `还有 ${count - 1} 项远程请求，处理后依次显示。`) : null,
-        snapshot.error ? React.createElement('p', { className: 'dsh-hub-remote-error', role: 'alert' }, snapshot.error) : null,
-      )
-    }
-
-    function installChatInteractions(ctx) {
-      // Local native approvals/questions take precedence. Publish exactly one
-      // deterministic remote request per owning chat; the next follows on reply.
-      const publish = ctx.uiSession.registerPendingInteraction(() => -1)
-      const visible = new Map()
-      const reconcile = () => {
-        const selected = new Map()
-        const candidates = pendingRuns(remoteSnapshot).filter(run => run.scope === 'controller' && typeof run.originSessionId === 'string' && run.originSessionId)
-          .flatMap(run => (run.requests || []).filter(request => !run.nativeRequestIds?.includes(request.id)).map(request => ({ run, request })))
-          .sort((a, b) => Number(b.request.kind === 'approval') - Number(a.request.kind === 'approval') || a.request.createdAt - b.request.createdAt || interactionKey(a.run, a.request).localeCompare(interactionKey(b.run, b.request)))
-        for (const item of candidates) if (!selected.has(item.run.originSessionId)) selected.set(item.run.originSessionId, item)
-        for (const [sessionId, entry] of visible) {
-          const next = selected.get(sessionId)
-          if (next && entry.pending.key === `hub-remote:${interactionKey(next.run, next.request)}`) continue
-          entry.remove(); visible.delete(sessionId)
-        }
-        for (const [sessionId, { run, request }] of selected) {
-          if (visible.has(sessionId)) continue
-          const pending = new PendingRemoteInteraction(run, request)
-          const remove = publish(pending, async () => { visible.delete(sessionId) })
-          visible.set(sessionId, { pending, remove })
-        }
-      }
-      ctx.effect(() => {
-        remoteListeners.add(reconcile)
-        reconcile()
-        return () => {
-          remoteListeners.delete(reconcile)
-          for (const entry of visible.values()) entry.remove()
-          visible.clear()
-        }
-      }, 'dsh-server-hub: chat request lifetime')
-      ctx.slots.inject('conversation.composer', () => ctx.slots.register({
-        name: 'conversation.composer', id: 'dsh-server-hub-chat-interaction', priority: 1,
-        select: ({ pendingInteraction }) => pendingInteraction instanceof PendingRemoteInteraction ? pendingInteraction : null,
-      }, RemoteChatInteraction))
-    }
-
     let settingsParentOrigin = null
     const remoteUnavailable = '远控连接请使用根路径 loopback 页面（localhost、127.* 或 [::1]）；代理页面仍可使用原有 Hub 功能。'
 
@@ -728,9 +510,9 @@ window.__ModuleLoader__.load({
       }, () => remoteSnapshot, () => remoteSnapshot)
     }
 
-    async function remoteRequest(suffix, { method = 'GET', body, signal } = {}) {
+    async function remoteRequest(suffix, { method = 'GET', body } = {}) {
       const response = await window.fetch(`${REMOTE_ROUTE}${suffix}`, {
-        method, credentials: 'same-origin', ...(signal ? { signal } : {}),
+        method, credentials: 'same-origin',
         headers: { accept: 'application/json', ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       })
@@ -740,7 +522,7 @@ window.__ModuleLoader__.load({
         // Decode only known error codes; never display arbitrary response text,
         // which could contain upstream credentials or an unrelated HTML page.
         const failure = await response.json().catch(() => null)
-        if (failure && Object.hasOwn(connectionErrors, failure.code)) throw Object.assign(new Error(`${connectionErrors[failure.code]}（${failure.code}）`), { code: failure.code })
+        if (failure && Object.hasOwn(connectionErrors, failure.code)) throw new Error(`${connectionErrors[failure.code]}（${failure.code}）`)
         if (failure?.code === 'REMOTE_HTTP' && Number.isInteger(failure.remoteStatus)) throw new Error(`远程接口返回 HTTP ${failure.remoteStatus}；请检查远程插件与网页访问许可。`)
         throw new Error(`远控请求失败：HTTP ${response.status}；请检查两端插件状态。`)
       }
@@ -758,7 +540,6 @@ window.__ModuleLoader__.load({
     }
 
     async function openRemoteSettings(parentOrigin = null) {
-      stopInteractionRefresh()
       const epoch = ++remoteEpoch
       settingsParentOrigin = parentOrigin
       publishRemote({ kind: 'settings', target: null, loading: true, saving: false, config: null, error: null, notice: '' })
@@ -775,8 +556,6 @@ window.__ModuleLoader__.load({
     }
 
     function closeRemoteModal(notify = true) {
-      stopInteractionRefresh()
-      interactionDrafts = {}
       if (notify && remoteSnapshot.kind === 'settings') notifySettingsParent(REMOTE_CLOSED)
       settingsParentOrigin = null
       remoteEpoch += 1
@@ -872,23 +651,19 @@ window.__ModuleLoader__.load({
     }
 
     async function openRemotePanel(item = null, notice = '') {
-      stopInteractionRefresh()
       const target = item && item.source !== 'local' ? item : null
       const epoch = ++remoteEpoch
       settingsParentOrigin = null
-      publishRemote({ kind: 'manager', target, config: null, waitForResult: null, savingMode: false, loading: true, saving: false, error: null, notice })
+      publishRemote({ kind: 'manager', target, config: null, waitForResult: null, savingMode: false, runs: [], loading: true, saving: false, error: null, notice })
       if (target && !remoteControlAvailable()) { publishRemote({ loading: false, error: remoteUnavailable }); return }
       try {
-        const generation = ++activityGeneration
         const [config, , activity] = await Promise.all([
           target ? null : remoteRequest('/config').then(configValue),
           remoteControlAvailable() ? loadRemoteConnections() : null,
-          remoteControlAvailable() ? remoteRequest('/activity', { signal: AbortSignal.timeout(10000) }).catch(error => ({ error: remoteError(error) })) : null,
+          remoteControlAvailable() ? remoteRequest('/activity').catch(() => null) : null,
         ])
         if (epoch === remoteEpoch) publishRemote({ waitForResult: config ? config.waitForResult === true : null,
-          ...(generation !== activityGeneration ? {} : activity && Array.isArray(activity.runs) ? { runs: activity.runs, activityError: null } :
-            activity ? { activityError: activity.error || '实例返回了无效的待处理请求列表', error: activity.error || '实例返回了无效的待处理请求列表' } : {}), loading: false })
-        if (epoch === remoteEpoch && remoteControlAvailable()) startInteractionRefresh(epoch)
+          runs: activity && Array.isArray(activity.runs) ? activity.runs : [], loading: false })
       } catch (error) {
         if (epoch === remoteEpoch) publishRemote({ loading: false, error: remoteError(error) })
       }
@@ -896,7 +671,6 @@ window.__ModuleLoader__.load({
 
     async function connectRemoteInstance(item) {
       if (!remoteControlAvailable()) { publishRemote({ notice: remoteUnavailable }); return }
-      stopInteractionRefresh()
       const epoch = ++remoteEpoch
       const revision = ++connectionsRevision
       publishRemote({ kind: 'manager', target: item, loading: true, error: null, notice: `正在连接远程 :${item.port}…` })
@@ -909,7 +683,6 @@ window.__ModuleLoader__.load({
       } catch (error) {
         if (epoch === remoteEpoch) publishRemote({ loading: false, error: remoteError(error), notice: '' })
       } finally {
-        if (epoch === remoteEpoch && remoteSnapshot.kind === 'manager') startInteractionRefresh(epoch)
       }
     }
 
@@ -972,8 +745,6 @@ window.__ModuleLoader__.load({
       }
       window.addEventListener('message', onMessage)
       return () => {
-        stopInteractionRefresh()
-        interactionDrafts = {}
         window.removeEventListener('message', onMessage)
         childFrames.clear()
         pendingSettingsTarget = null
@@ -1047,12 +818,7 @@ window.__ModuleLoader__.load({
             )),
           ) : null,
           !settingsOnly && !target && !snapshot.loading && snapshot.connectionsKnown && !snapshot.connections.length ? React.createElement('p', null, '尚未连接远程。请在 Hub 选中要使用的实例，打开「远控设置」。') : null,
-          !settingsOnly ? pendingRuns(snapshot).filter(run => !target || (connected && run.targetId === connected.targetId)).map(run =>
-            (run.requests || []).length ? run.requests.map(request => interactionCard(run, request, snapshot)) :
-              React.createElement('article', { key: `${run.scope}:${run.runId}`, className: 'dsh-hub-remote-target', role: 'alert' },
-                React.createElement('strong', null, `${run.description || run.runId} · 等待输入，但没有可回复的请求`),
-                React.createElement('p', null, '请检查两端插件版本及远端审批入口；更新两端插件并重启后再使用。不要重复派单或自动放开权限。')),
-          ) : null,
+          !settingsOnly && snapshot.runs.some(run => (run.requests || []).length) ? React.createElement('p', { className: 'dsh-hub-remote-description' }, '远程审批和提问会发到派任务的聊天中，请直接与主控 Agent 对话。') : null,
           !settingsOnly && !target && snapshot.runs.length ? React.createElement('details', null, React.createElement('summary', null, '任务记录'), snapshot.runs.map((run) => React.createElement('p', { key: run.runId }, `${run.description || run.runId} · ${run.state || 'unknown'}`))) : null,
           React.createElement('div', { className: 'dsh-hub-remote-actions' },
             !settingsOnly ? React.createElement('button', { type: 'button', className: 'dsh-hub-action', disabled: snapshot.loading || snapshot.saving || snapshot.savingMode, onClick: () => openRemotePanel(target) }, '刷新') : null,
@@ -1358,7 +1124,6 @@ window.__ModuleLoader__.load({
         RemoteOverlay,
       ))
       if (window.parent !== window) return
-      installChatInteractions(ctx)
 
       ctx.slots.inject('shell.overlay', () => ctx.slots.register(
         { name: 'shell.overlay', id: 'dsh-server-hub-monitor', order: -1000, label: 'DSH Server Hub Monitor' },

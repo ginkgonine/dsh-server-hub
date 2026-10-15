@@ -356,7 +356,7 @@ test('real ordinary question is claimed, whitelisted and answered through its or
   const snapshot = await waiting, [pending] = snapshot.requests
   assert.match(pending.id, /^request-/)
   assert.deepEqual(pending.questions, questionRequest(agent).questions)
-  assert.equal(pending.requiresHuman, false)
+  assert.equal('requiresHuman' in pending, false)
   assert.equal('agent' in pending, false)
   assert.equal('signal' in pending, false)
   assert.ok(snapshot.revision > run.revision)
@@ -370,17 +370,19 @@ test('real ordinary question is claimed, whitelisted and answered through its or
   assert.equal('responseReceipts' in resumed, false)
 })
 
-test('overlapping real questions and approval prioritize approval, and only the human path grants', async t => {
+test('overlapping real questions and approval prioritize approval and accept an ordinary controller decision', async t => {
   const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
   const first = interactionChange(f.worker, 1, 'waiting_input')
   const question = f.hooks.get('user-questions/request')(questionRequest(agent), () => assert.fail('no remote UI'))
   const questionId = (await first).requests[0].id
   const second = interactionChange(f.worker, 2, 'waiting_approval')
   const approval = f.hooks.get('approval/request')(approvalRequest(agent), () => assert.fail('no remote UI'))
-  const approvalId = (await second).requests.find(request => request.kind === 'approval').id
-  await assert.rejects(f.worker.respond(run.runId, approvalId, { outcome: 'allowed-once' }), { code: 'REMOTE_HUMAN_REQUIRED' })
-  assert.equal((await f.worker.get(run.runId)).requests.length, 2)
-  const remaining = await f.worker.respond(run.runId, approvalId, { outcome: 'allowed-once' }, { human: true })
+  const snapshot = await second
+  const pendingApproval = snapshot.requests.find(request => request.kind === 'approval')
+  const approvalId = pendingApproval.id
+  assert.equal('requiresHuman' in pendingApproval, false)
+  assert.equal(snapshot.requests.length, 2)
+  const remaining = await f.worker.respond(run.runId, approvalId, { outcome: 'allowed-once' })
   assert.equal(await approval, 'allowed-once')
   assert.equal(remaining.state, 'waiting_input')
   await f.worker.respond(run.runId, questionId, safeAnswer())
@@ -389,17 +391,31 @@ test('overlapping real questions and approval prioritize approval, and only the 
   assert.equal(f.prompts.length, 1)
 })
 
-test('intent-bearing questions retain native detail and intent but reject the ordinary reply channel', async t => {
+test('approval outcomes are returned directly through the ordinary controller reply channel', async t => {
+  for (const outcome of ['allowed-once', 'rejected', 'cancelled', 'unavailable']) await t.test(outcome, async t => {
+    const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
+    const waiting = interactionChange(f.worker, 1, 'waiting_approval')
+    const answer = f.hooks.get('approval/request')(approvalRequest(agent), () => assert.fail('no remote UI'))
+    const [pending] = (await waiting).requests
+    assert.equal('requiresHuman' in pending, false)
+    const resumed = await f.worker.respond(run.runId, pending.id, { outcome })
+    assert.equal(await answer, outcome)
+    assert.equal(resumed.state, 'running')
+    assert.deepEqual(resumed.requests, [])
+    assert.equal(f.prompts.length, 1)
+  })
+})
+
+test('intent-bearing questions retain native detail and intent and accept ordinary controller replies', async t => {
   const f = fixture(t), run = await f.worker.start(f.input), agent = f.agents.get(run.sessionId)
   const request = questionRequest(agent)
   request.questions[0].intent = { kind: 'plan-review', approve: 'Safe', callId: 'plan-call' }
   const waiting = interactionChange(f.worker, 1)
   const answer = f.hooks.get('user-questions/request')(request, () => assert.fail('no next'))
   const [pending] = (await waiting).requests
-  assert.equal(pending.requiresHuman, true)
+  assert.equal('requiresHuman' in pending, false)
   assert.deepEqual(pending.questions[0].intent, request.questions[0].intent)
-  await assert.rejects(f.worker.respond(run.runId, pending.id, safeAnswer()), { code: 'REMOTE_HUMAN_REQUIRED' })
-  await f.worker.respond(run.runId, pending.id, safeAnswer(), { human: true })
+  await f.worker.respond(run.runId, pending.id, safeAnswer())
   assert.deepEqual(await answer, safeAnswer())
 })
 
@@ -437,7 +453,7 @@ test('request signal abort immediately withdraws questions and approvals and rej
   await f.worker.tail
   assert.deepEqual((await f.worker.get(run.runId)).requests, [])
   for (const request of snapshot.requests) await assert.rejects(f.worker.respond(run.runId, request.id,
-    request.kind === 'approval' ? { outcome: 'allowed-once' } : safeAnswer(), { human: true }), { code: 'REMOTE_REQUEST_EXPIRED' })
+    request.kind === 'approval' ? { outcome: 'allowed-once' } : safeAnswer()), { code: 'REMOTE_REQUEST_EXPIRED' })
   assert.equal(f.prompts.length, 1)
 })
 
@@ -468,7 +484,7 @@ test('worker cancellation and close settle every owned deferred without relying 
   await rejected
   assert.equal(await approval, 'cancelled')
   assert.deepEqual((await f.worker.get(run.runId)).requests, [])
-  await assert.rejects(f.worker.respond(run.runId, snapshot.requests[1].id, { outcome: 'allowed-once' }, { human: true }), { code: 'REMOTE_REQUEST_EXPIRED' })
+  await assert.rejects(f.worker.respond(run.runId, snapshot.requests[1].id, { outcome: 'allowed-once' }), { code: 'REMOTE_REQUEST_EXPIRED' })
   const second = await f.worker.start({ ...f.input, runId: 'run-2' })
   const secondWaiting = interactionChange(f.worker, 1)
   const another = f.hooks.get('approval/request')(approvalRequest(f.agents.get(second.sessionId)), () => assert.fail('no next'))
@@ -503,7 +519,7 @@ test('restart clears pending questions/approval without recreating, prompting or
   assert.deepEqual(recovered.requests, [])
   assert.equal(restored.creates.length, 0)
   assert.equal(restored.prompts.length, 0)
-  await assert.rejects(restored.worker.respond(run.runId, pending.id, { outcome: 'allowed-once' }, { human: true }), { code: 'REMOTE_REQUEST_EXPIRED' })
+  await assert.rejects(restored.worker.respond(run.runId, pending.id, { outcome: 'allowed-once' }), { code: 'REMOTE_REQUEST_EXPIRED' })
   await f.worker.close()
   assert.equal(await original, 'cancelled')
 })
@@ -546,7 +562,7 @@ test('abort during response persistence cannot resume an approval even after its
     if (value.responseReceipts?.[pending.id] && !value.responseReceipts[pending.id].expired) { entered.resolve(); await release.promise }
     return put(space, key, value)
   }
-  const reply = f.worker.respond(run.runId, pending.id, { outcome: 'allowed-once' }, { human: true })
+  const reply = f.worker.respond(run.runId, pending.id, { outcome: 'allowed-once' })
   const rejected = assert.rejects(reply, { code: 'REMOTE_REQUEST_EXPIRED' })
   await entered.promise
   signal.abort()
@@ -555,6 +571,6 @@ test('abort during response persistence cannot resume an approval even after its
   await rejected
   await f.worker.tail
   assert.equal(f.data.get(run.runId).responseReceipts[pending.id].expired, true)
-  await assert.rejects(f.worker.respond(run.runId, pending.id, { outcome: 'allowed-once' }, { human: true }), { code: 'REMOTE_REQUEST_EXPIRED' })
+  await assert.rejects(f.worker.respond(run.runId, pending.id, { outcome: 'allowed-once' }), { code: 'REMOTE_REQUEST_EXPIRED' })
   assert.deepEqual((await f.worker.get(run.runId)).requests, [])
 })

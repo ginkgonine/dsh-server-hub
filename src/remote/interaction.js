@@ -68,11 +68,11 @@ function payload(kind, value, strict) {
     const source = fields(value, ['questions'], strict)
     const questions = list(source.questions, 'questions', 1).map(value => question(value, strict))
     if (new Set(questions.map(item => item.id)).size !== questions.length) fail('Duplicate interaction question id')
-    return { requiresHuman: questions.some(item => item.intent !== undefined), questions }
+    return { questions }
   }
   if (kind !== 'approval') fail('Unsupported interaction kind')
   const source = fields(value, ['toolName', 'callId', 'reason', 'displayReason'], strict)
-  const result = { requiresHuman: true, toolName: text(source.toolName, 'toolName') }
+  const result = { toolName: text(source.toolName, 'toolName') }
   for (const key of ['callId', 'reason']) if (Object.hasOwn(source, key)) result[key] = text(source[key], key, key !== 'reason')
   if (Object.hasOwn(source, 'displayReason')) {
     if (!plain(source.displayReason)) fail('Invalid interaction displayReason')
@@ -98,7 +98,7 @@ export function serializeInteraction(kind, request, { id = `request-${randomUUID
   return bounded({ ...metadata(id, createdAt), kind, ...payload(kind, request, false) })
 }
 
-/** Validate an untrusted snapshot, including its derived human-only flag. */
+/** Validate an untrusted snapshot. Legacy human-only flags are ignored. */
 export function normalizeInteractions(requests) {
   if (requests === undefined) return []
   const seen = new Set()
@@ -108,7 +108,7 @@ export function normalizeInteractions(requests) {
     if (Object.keys(source).some(key => !['id', 'kind', 'requiresHuman', 'createdAt', ...allowed].includes(key))) fail('Fields do not match interaction kind')
     const data = Object.fromEntries(allowed.filter(key => Object.hasOwn(source, key)).map(key => [key, source[key]]))
     const projected = { ...metadata(source.id, source.createdAt), kind: source.kind, ...payload(source.kind, data, true) }
-    if (source.requiresHuman !== projected.requiresHuman) fail('Invalid interaction human-only flag')
+    if (Object.hasOwn(source, 'requiresHuman') && typeof source.requiresHuman !== 'boolean') fail('Invalid legacy interaction flag')
     if (seen.has(projected.id)) fail('Duplicate interaction request id')
     seen.add(projected.id)
     return projected
@@ -116,10 +116,9 @@ export function normalizeInteractions(requests) {
   return bounded(result)
 }
 
-/** Return only the native response; this function never grants on a model path. */
-export function validateInteractionResponse(interaction, input, { human = false } = {}) {
+/** Validate a decision from the owning controller without imposing a UI channel. */
+export function validateInteractionResponse(interaction, input) {
   const [request] = normalizeInteractions([interaction])
-  if (request.requiresHuman && human !== true) throw Object.assign(new Error('This interaction requires a human response'), { code: 'REMOTE_HUMAN_REQUIRED' })
   if (request.kind === 'approval') {
     const source = fields(input, ['outcome'], true)
     if (!['allowed-once', 'rejected', 'cancelled', 'unavailable'].includes(source.outcome)) fail('Invalid approval outcome')

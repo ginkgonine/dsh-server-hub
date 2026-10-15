@@ -10,7 +10,7 @@ import { RemoteStore } from '../src/remote/store.js'
 test('Cordis injection metadata names services directly, not required/optional pseudo-services', () => {
   assert.ok(Array.isArray(inject))
   assert.deepEqual(inject, ['webServer', 'connection', 'storage', 'storage.backend.json', 'credentials',
-    'workspaceRegistry', 'sessionController', 'sessions', 'tools', 'subagents', 'agents', 'userQuestions', 'approval'])
+    'workspaceRegistry', 'sessionController', 'sessions', 'tools', 'subagents'])
 })
 
 test('published entry and bundle retain the same direct service dependencies', async () => {
@@ -463,55 +463,64 @@ test('background questions cross real HTTP/SSE and ordinary reply resumes one or
   for (const key of ['prompt', 'originSessionId', 'responseReceipts', 'interactionNotifications']) assert.equal(key in publicStatus, false)
 })
 
-test('background approvals never grant via model tool; authenticated Hub human reply continues the same task', async t => {
-  const { main, worker, connection } = await connected(t)
-  const exec = { agent: main.parent, callId: 'approval-background', signal: new AbortController().signal }
-  const submit = await main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: '显卡权限', prompt: 'inspect GPU' }, exec)
-  const agent = worker.agents.get(worker.creates[0].sessionId)
-  const original = worker.hooks.get('approval/request')({ agent, toolName: 'bash', callId: 'gpu-call', reason: 'Query GPU devices', signal: new AbortController().signal }, () => assert.fail('worker must own approval'))
-  const status = await controllerState(main.runtime.controller, submit.runId, 'waiting_approval')
-  const requestId = status.requests[0].id
-  const activity = (await main.request('/activity')).value.runs.find(run => run.scope === 'controller' && run.runId === submit.runId)
-  assert.equal(activity.originSessionId, main.parent.id, 'Web routes the card to the dispatching chat, not the remote worker session')
-  assert.deepEqual(activity.nativeRequestIds, [])
-  assert.equal(main.prompts.length, 0, 'approval card does not wake the parent model')
-  await assert.rejects(main.tools.get('remote_agent_respond').execute({ runId: submit.runId, requestId, answers: [], human: true }, exec), { code: 'REMOTE_HUMAN_REQUIRED' })
-  const path = `/delegated/${submit.runId}/requests/${requestId}/response`
-  assert.equal((await main.request(path, { method: 'POST', input: { response: { outcome: 'allowed-once' }, targetId: connection.targetId } })).status, 400)
-  const response = await main.request(path, { method: 'POST', input: { response: { outcome: 'allowed-once' } } })
-  assert.equal(response.status, 200)
-  assert.equal(await bounded(original), 'allowed-once')
-  assert.equal(worker.creates.length, 1)
-  assert.equal(worker.prompts.length, 1)
-  const again = await main.request(path, { method: 'POST', input: { response: { outcome: 'allowed-once' } } })
-  assert.ok([200, 400].includes(again.status), 'duplicate response can deduplicate or be stale, never new work')
-  worker.finish(agent.id)
-  await controllerState(main.runtime.controller, submit.runId, 'completed')
+test('background write approval reaches the controller chat and its Agent can relay allow, reject or cancel without a GUI', async t => {
+  for (const outcome of ['allowed-once', 'rejected', 'cancelled']) {
+    const { main, worker, connection } = await connected(t)
+    const exec = { agent: main.parent, callId: `write-${outcome}`, signal: new AbortController().signal }
+    main.ctx.userQuestions.ask = () => assert.fail('No automatic ask bridge')
+    main.ctx.approval.request = () => assert.fail('No local escalation bridge')
+    const submit = await main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: '写入配置', prompt: 'write config' }, exec)
+    const agent = worker.agents.get(worker.creates[0].sessionId)
+    const notice = once(main.notices, 'report')
+    const original = worker.hooks.get('approval/request')({ agent, toolName: 'write', callId: 'write-call', reason: 'Write outside the workspace sandbox', signal: new AbortController().signal }, () => assert.fail('worker must own approval'))
+    const status = await controllerState(main.runtime.controller, submit.runId, 'waiting_approval')
+    const [notification] = await bounded(notice)
+    assert.equal(notification.sessionId, main.parent.id)
+    assert.match(notification.content[0].text, /write/)
+    assert.match(notification.content[0].text, /正常回复询问/)
+    assert.match(notification.content[0].text, /remote_agent_respond/)
+    assert.doesNotMatch(notification.content[0].text, /Hub UI|requiresHuman|必须由人类/)
+    assert.equal('requiresHuman' in status.requests[0], false)
+    const args = { runId: submit.runId, requestId: status.requests[0].id, outcome }
+    await assert.rejects(main.tools.get('remote_agent_respond').execute(args, { agent: { id: 'other-parent' } }), /belong/)
+    const response = await main.tools.get('remote_agent_respond').execute(args, exec)
+    assert.equal(response.state, 'running')
+    assert.equal(await bounded(original), outcome)
+    assert.equal(worker.creates.length, 1)
+    assert.equal(worker.prompts.length, 1)
+    worker.finish(agent.id)
+    await controllerState(main.runtime.controller, submit.runId, 'completed')
+  }
 })
 
-test('foreground questions and approvals reach parent native answerers and finish in one waiting tool call', async t => {
+test('foreground questions and approvals return control to the Agent instead of waiting on a GUI or deadlocking', async t => {
   for (const kind of ['questions', 'approval']) {
     const { main, worker, connection } = await connected(t)
     await main.request('/config', { method: 'PUT', input: { waitForResult: true } })
-    const native = deferred()
-    const answer = deferred()
-    main.ctx.userQuestions.ask = async request => { native.resolve(request); return answer.promise }
-    main.ctx.approval.request = async request => { native.resolve(request); return answer.promise }
+    main.ctx.userQuestions.ask = () => assert.fail('The controller Agent chooses how to ask the user')
+    main.ctx.approval.request = () => assert.fail('No native escalation forwarding')
     const started = once(worker.notices, 'worker-prompt')
+    const ac = new AbortController()
     const result = main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: '交互巡检', prompt: 'inspect', run_in_background: true },
-      { agent: main.parent, callId: `native-${kind}`, signal: new AbortController().signal })
+      { agent: main.parent, callId: `foreground-${kind}`, signal: ac.signal })
     await bounded(started)
     const agent = worker.agents.get(worker.creates[0].sessionId)
     const original = worker.hooks.get(kind === 'questions' ? 'user-questions/request' : 'approval/request')({ agent, signal: new AbortController().signal,
-      ...(kind === 'questions' ? questionPayload() : { toolName: 'bash', reason: 'GPU query' }) }, () => assert.fail('must capture'))
-    const request = await bounded(native.promise)
-    assert.equal(request.agent, main.parent, 'native waterfall borrows exact original parent, not fabricated Agent')
-    if (kind === 'questions') { assert.equal(request.questions[0].question, '选择检查范围'); answer.resolve(questionAnswer()) }
-    else { assert.equal(request.toolName, 'bash'); answer.resolve('allowed-once') }
+      ...(kind === 'questions' ? questionPayload() : { toolName: 'write', reason: 'Write config' }) }, () => assert.fail('must capture'))
+    const pending = await bounded(result)
+    assert.equal(pending.requests[0].kind, kind)
+    assert.match(pending.message, /当前聊天/)
+    assert.equal(main.prompts.length, 0, 'the waiting tool returns the request, without also queueing another notification')
+    assert.equal((await worker.runtime.worker.get(pending.runId)).state, kind === 'questions' ? 'waiting_input' : 'waiting_approval')
+    ac.abort() // Completion of the old tool call must not cancel the yielded task.
+    const reply = kind === 'questions' ? questionAnswer() : { outcome: 'allowed-once' }
+    await main.tools.get('remote_agent_respond').execute({ runId: pending.runId, requestId: pending.requests[0].id, ...reply },
+      { agent: main.parent, callId: 'reply', signal: new AbortController().signal })
     assert.deepEqual(await bounded(original), kind === 'questions' ? questionAnswer() : 'allowed-once')
+    const final = once(main.notices, 'report')
     worker.finish(agent.id)
-    assert.equal((await bounded(result)).stopReason, 'completed')
-    assert.equal(main.prompts.length, 0, 'native interactions must not create second parent turn')
+    await bounded(final)
+    assert.equal(main.prompts.length, 1, 'only the eventual completion is reported in a new parent turn')
     assert.equal(worker.prompts.length, 1)
   }
 })
