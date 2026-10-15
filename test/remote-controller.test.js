@@ -313,21 +313,52 @@ test('background notification is durable, stable and deduplicated across snapsho
   f.ctx.approval = { request: () => { throw new Error('No background native approvals') } }
   await Promise.all([f.controller.accept(record, { ...record, revision: 2 }), f.controller.accept(record, { ...record, revision: 2 })])
   await tick()
-  assert.equal(f.reports.length, 2)
-  assert.deepEqual(f.records.get(record.runId).notifiedRequests.sort(), ['request-approval', 'request-question'])
-  assert.deepEqual(f.reports.map(item => item.requestId).sort(), ['hub-question-remote-run-1-request-approval', 'hub-question-remote-run-1-request-question'])
+  assert.equal(f.reports.length, 1)
+  assert.deepEqual(f.records.get(record.runId).notifiedRequests, ['request-question'])
+  assert.deepEqual(f.reports.map(item => item.requestId), ['hub-question-remote-run-1-request-question'])
   assert.ok(f.reports.every(item => item.sessionId === 'parent' && item.mode === 'queue'))
   assert.ok(f.reports.every(item => !/PRIVATE-|private-cookie/.test(JSON.stringify(item))))
   const restored = new RemoteController(f.ctx, f.store, { ...f.controller.connections, get: async () => undefined })
   t.after(() => restored.close())
   await restored.initialize()
   await tick()
-  assert.equal(f.reports.length, 2)
+  assert.equal(f.reports.length, 1)
   assert.equal(f.requests.length, 0, 'initialize recovery only observes, never re-dispatches')
   const publicValue = await restored.status(record.runId, 'parent')
   assert.deepEqual(publicValue.requests, record.requests)
   assert.equal(publicValue.revision, 2)
   assert.ok(!/PRIVATE-|notifiedRequests|originSessionId|responseReceipts|prompt/.test(JSON.stringify(publicValue)))
+})
+
+test('human-only background requests route to the owning Web chat without waking a model or entering native answerers', async t => {
+  const f = fixture(t), review = questions('request-review')
+  review.questions[0].detail = '# Remote plan'
+  review.questions[0].intent = { kind: 'plan-review', approve: 'A' }
+  review.requiresHuman = true
+  const record = seed(f, { state: 'waiting_approval', requests: [approval(), review] })
+  f.ctx.userQuestions = { ask: () => assert.fail('Background review must be answered in Web UI') }
+  f.ctx.approval = { request: () => assert.fail('Idle parent must not run an approval waterfall') }
+  await f.controller.accept(record, { ...record, revision: 2 })
+  await tick()
+  await f.controller.notify(record, record.requests[0])
+  assert.equal(f.reports.length, 0)
+  const [activity] = await f.controller.activity()
+  assert.equal(activity.originSessionId, 'parent')
+  assert.deepEqual(activity.requests, record.requests)
+  assert.deepEqual(activity.nativeRequestIds, [])
+  assert.equal(f.controller.bridges.size, 0)
+  assert.equal((await f.controller.status(record.runId, 'parent')).originSessionId, undefined, 'only Web activity receives chat routing data')
+})
+
+test('Web activity excludes a request already presented through a live native bridge, then restores fallback when bridge is released', { skip: !nativeRuntime }, async t => {
+  const f = await nativeFixture(t, approval())
+  f.scoped.on('approval/request', request => new Promise(resolve => request.signal.addEventListener('abort', () => resolve('cancelled'), { once: true })))
+  await f.controller.start({ ...f.input, background: false }, f.parent, new AbortController().signal)
+  await tick()
+  assert.deepEqual((await f.controller.activity())[0].nativeRequestIds, ['request-approval'])
+  f.controller.releaseParent(f.input.runId)
+  assert.deepEqual((await f.controller.activity())[0].nativeRequestIds, [])
+  assert.deepEqual((await f.controller.activity())[0].requests, [approval()])
 })
 
 test('failed notification checkpoint retries the same admission ID and missing parent stays pending', async t => {

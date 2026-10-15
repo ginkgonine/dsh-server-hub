@@ -471,6 +471,10 @@ test('background approvals never grant via model tool; authenticated Hub human r
   const original = worker.hooks.get('approval/request')({ agent, toolName: 'bash', callId: 'gpu-call', reason: 'Query GPU devices', signal: new AbortController().signal }, () => assert.fail('worker must own approval'))
   const status = await controllerState(main.runtime.controller, submit.runId, 'waiting_approval')
   const requestId = status.requests[0].id
+  const activity = (await main.request('/activity')).value.runs.find(run => run.scope === 'controller' && run.runId === submit.runId)
+  assert.equal(activity.originSessionId, main.parent.id, 'Web routes the card to the dispatching chat, not the remote worker session')
+  assert.deepEqual(activity.nativeRequestIds, [])
+  assert.equal(main.prompts.length, 0, 'approval card does not wake the parent model')
   await assert.rejects(main.tools.get('remote_agent_respond').execute({ runId: submit.runId, requestId, answers: [], human: true }, exec), { code: 'REMOTE_HUMAN_REQUIRED' })
   const path = `/delegated/${submit.runId}/requests/${requestId}/response`
   assert.equal((await main.request(path, { method: 'POST', input: { response: { outcome: 'allowed-once' }, targetId: connection.targetId } })).status, 400)

@@ -42,7 +42,7 @@ async function loadClientModule() {
 test('exports a top-level Hub client package', async () => {
   const { client, definition } = await loadClientModule()
   assert.equal(definition.id, 'dsh-server-hub')
-  assert.deepEqual(client.inject, ['slots', 'layout'])
+  assert.deepEqual(client.inject, ['slots', 'layout', 'uiSession'])
   assert.equal(typeof client.apply, 'function')
 })
 
@@ -68,7 +68,7 @@ test('registers compatible slots and polls within root and proxy mounts', async 
     const slots = new Map()
     const injected = []
     const selected = []
-    let requested
+    const requested = []
     let cleared = false
     windowStub.document.baseURI = base
     windowStub.document.createElement = () => ({ dataset: {}, remove() {} })
@@ -76,25 +76,28 @@ test('registers compatible slots and polls within root and proxy mounts', async 
     windowStub.setInterval = () => 1
     windowStub.clearInterval = () => { cleared = true }
     windowStub.fetch = async (url, options) => {
-      requested = new URL(url, windowStub.document.baseURI).href
+      requested.push(new URL(url, windowStub.document.baseURI).href)
       assert.equal(options.credentials, 'same-origin')
-      return { ok: true, json: async () => ({ instances: [], states: {} }) }
+      return { ok: true, json: async () => url.endsWith('/activity') ? { runs: [] } :
+        url.endsWith('/connections') ? { connections: [] } : { instances: [], states: {} } }
     }
     client.apply({
       effect(callback) { return callback() },
       layout: { selectPanel(id) { selected.push(id) } },
+      uiSession: { registerPendingInteraction: () => () => () => {} },
       slots: {
         inject(name, callback) { injected.push(name); callback() },
         register(options, component) { slots.set(options.name, { options, component }); return () => {} },
       },
     })
-    assert.deepEqual(injected, ['shell.overlay', 'shell.overlay', 'sidebar.panellist', 'main'])
+    assert.deepEqual(injected, ['shell.overlay', 'conversation.composer', 'shell.overlay', 'sidebar.panellist', 'main'])
     assert.equal(slots.get('main').options.key, slots.get('sidebar.panellist').options.id)
     const monitor = slots.get('shell.overlay').component()
     monitor.type(monitor.props)
     const cleanup = effects[0]()
     await new Promise((resolve) => setImmediate(resolve))
-    assert.equal(requested, `${base}api/dsh-server-hub/overview?`)
+    assert.ok(requested.includes(`${base}api/dsh-server-hub/overview?`))
+    assert.equal(requested.includes(`${base}api/dsh-server-hub/remote/activity`), base.startsWith('http://localhost'))
     cleanup()
     assert.equal(cleared, true)
     assert.deepEqual(selected, [])

@@ -18,7 +18,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve))
 
 async function harness({ base = 'http://localhost:3080/', embedded = false, referrer = 'http://localhost:3080/', fetch: doFetch, initialConnections = [], names = {}, overviewData = overview, manualPorts = [], hiddenPorts = [], confirm = true, storageWritable = true, activityRuns = [{ runId: 'r1', sessionId: 's1', state: 'running', description: 'Check CPU' }] } = {}) {
   let definition
-  const listeners = new Map(), requests = [], disposers = [], slots = new Map(), effects = [], intervals = new Map()
+  const listeners = new Map(), requests = [], disposers = [], slots = new Map(), effects = [], intervals = new Map(), intervalDelays = new Map(), pendingInteractions = new Map(), publishedInteractions = []
   let intervalId = 0, removedStyle = false, savedConfig = structuredClone(config), savedConnections = structuredClone(initialConnections)
   const confirmations = []
   const parent = { sent: [], postMessage(data, origin) { this.sent.push({ data, origin }) } }
@@ -40,8 +40,8 @@ async function harness({ base = 'http://localhost:3080/', embedded = false, refe
     confirm(message) { confirmations.push(message); return typeof confirm === 'function' ? confirm(message) : confirm },
     addEventListener(type, callback) { listeners.set(type, callback) },
     removeEventListener(type, callback) { if (listeners.get(type) === callback) listeners.delete(type) },
-    setInterval(callback) { intervals.set(++intervalId, callback); return intervalId },
-    clearInterval(id) { intervals.delete(id) },
+    setInterval(callback, delay) { intervals.set(++intervalId, callback); intervalDelays.set(intervalId, delay); return intervalId },
+    clearInterval(id) { intervals.delete(id); intervalDelays.delete(id) },
     __ModuleLoader__: { load(value) { definition = value } },
     async fetch(url, options) {
       requests.push({ url, resolved: new URL(url, base).href, options })
@@ -98,6 +98,14 @@ async function harness({ base = 'http://localhost:3080/', embedded = false, refe
   client.apply({
     effect(callback) { const dispose = callback(); if (typeof dispose === 'function') disposers.push(dispose) },
     layout: { selectPanel() {} },
+    uiSession: { registerPendingInteraction(precedence) {
+      return (pending, delegate) => {
+        assert.equal(precedence(pending), -1, 'local native requests take precedence over remote ones')
+        pendingInteractions.set(pending.key, { pending, delegate })
+        publishedInteractions.push(pending)
+        return () => pendingInteractions.delete(pending.key)
+      }
+    } },
     slots: {
       inject(_name, callback) { callback() },
       register(options, component) { slots.set(options.id || options.key, { options, component }); return () => {} },
@@ -106,16 +114,26 @@ async function harness({ base = 'http://localhost:3080/', embedded = false, refe
   function render(component, props) { current = component; stateIndex = 0; return component(props) }
   function panel() { const node = slots.get('dsh-server-hub').component(); return render(node.type, node.props) }
   function modal() { return render(slots.get('dsh-server-hub-remote-settings').component) }
-  async function mountMonitor() {
+  function chat(sessionId = 'parent-1') {
+    const slot = slots.get('dsh-server-hub-chat-interaction')
+    if (!slot) return null
+    const value = [...pendingInteractions.values()].find(entry => entry.pending.sessionId === sessionId)
+    const matched = slot.options.select({ pendingInteraction: value?.pending })
+    return matched ? render(slot.component, { sessionId, matched }) : null
+  }
+  function monitor() {
     const node = slots.get('dsh-server-hub-monitor').component()
-    render(node.type, node.props)
+    return render(node.type, node.props)
+  }
+  async function mountMonitor() {
+    monitor()
     const cleanup = effects[0]()
     if (cleanup) disposers.push(cleanup)
     await tick()
   }
   function message(source, origin, type, extra = {}) { listeners.get('message')?.({ source, origin, data: { type, ...extra } }) }
   function cleanup() { for (const dispose of disposers.reverse()) dispose() }
-  return { client, win, parent, listeners, requests, slots, intervals, panel, modal, mountMonitor, message, cleanup, confirmations,
+  return { client, win, parent, listeners, requests, slots, intervals, intervalDelays, pendingInteractions, publishedInteractions, panel, modal, chat, monitor, mountMonitor, message, cleanup, confirmations,
     preferences: () => structuredClone({ names, manualPorts, hiddenPorts }), styleRemoved: () => removedStyle }
 }
 function nodes(tree) {
@@ -535,7 +553,7 @@ test('iframe endpoints normalize page hostname without losing original overview 
     assert.ok(frames.every(frame => frame.props['data-dsh-hub-endpoint'] === frame.props.src && frame.props.referrerPolicy === 'origin'))
     const tab = nodes(h.panel()).find(node => node.type === 'button' && node.props['data-dsh-hub-port'] === 3081)
     assert.match(tab.props.title, /2 个 Agent 工作中/)
-    assert.equal(h.requests.length, 2, 'overview and one initial connection read only'); h.cleanup()
+    assert.equal(h.requests.length, 3, 'overview, initial connections, and pending activity read'); h.cleanup()
   }
 })
 
@@ -588,7 +606,7 @@ test('connect is explicit same-origin POST; shows connected rather than disabled
   h.cleanup()
 })
 
-test('only an open management panel refreshes pending interactions without model/session side effects', async () => {
+test('management panel fallback refreshes interactions without a shell monitor or model/session side effects', async () => {
   const h = await harness()
   await button(h.panel(), '远程管理').props.onClick()
   assert.deepEqual(h.requests.map(request => request.url), ['api/dsh-server-hub/remote/config', 'api/dsh-server-hub/remote/connections', 'api/dsh-server-hub/remote/activity'])
@@ -613,6 +631,256 @@ const pendingQuestion = () => ({ id: 'request-q1', kind: 'questions', requiresHu
   questions: [{ id: 'mode', question: '选择检查范围', options: [{ label: '只读', description: '不修改数据' }, { label: '完整' }] }] })
 const pendingApproval = () => ({ id: 'request-a1', kind: 'approval', requiresHuman: true, createdAt: 1,
   toolName: 'bash', reason: 'Allow GPU device access?', displayReason: { en: 'Allow GPU device access?', 'zh-CN': '允许查询显卡设备？' } })
+
+test('background approval appears directly in its owning idle chat and one click resumes the original remote run', async () => {
+  const run = { runId: 'r1', originSessionId: 'parent-1', targetId: connection.targetId, description: '检查显卡', scope: 'controller', state: 'waiting_approval', requests: [pendingApproval()], nativeRequestIds: [] }
+  const h = await harness({ activityRuns: [run], initialConnections: [{ ...connection, name: '88服务器' }] })
+  await h.mountMonitor()
+  assert.equal(h.modal(), null, 'no management panel is needed')
+  assert.equal(h.monitor(), null, 'routable chat requests do not send the user through a reminder button')
+  assert.match(text(h.chat()), /检查显卡.*等待人工审批/)
+  assert.match(text(h.chat()), /88服务器/)
+  assert.match(text(h.chat()), /允许查询显卡设备/)
+  assert.equal(h.chat('another-chat'), null)
+  assert.equal(h.requests.some(request => request.options.method === 'POST'), false, 'a card is not a grant')
+  await button(h.chat(), '允许一次').props.onClick()
+  const posts = h.requests.filter(request => request.options.method === 'POST')
+  assert.equal(posts.length, 1)
+  assert.equal(posts[0].url, 'api/dsh-server-hub/remote/delegated/r1/requests/request-a1/response')
+  assert.deepEqual(JSON.parse(posts[0].options.body), { response: { outcome: 'allowed-once' } })
+  assert.equal(h.confirmations.length, 0, 'the explicit chat card is the confirmation, like native approval')
+  assert.equal(h.chat(), null)
+  assert.equal(h.pendingInteractions.size, 0)
+  h.cleanup()
+})
+
+test('chat requests queue deterministically, retain drafts across polling and show the next question after approval', async () => {
+  const run = { runId: 'r1', originSessionId: 'parent-1', scope: 'controller', state: 'waiting_approval', requests: [pendingQuestion(), pendingApproval()] }
+  const h = await harness({ activityRuns: [run] })
+  await h.mountMonitor()
+  assert.equal(h.pendingInteractions.size, 1)
+  assert.match(text(h.chat()), /还有 1 项远程请求/)
+  assert.match(text(h.chat()), /等待人工审批/)
+  const poll = [...h.intervals].find(([id]) => h.intervalDelays.get(id) === 3000)[1]
+  await poll(); await tick()
+  assert.equal(h.publishedInteractions.length, 1, 'unchanged polls must not remount the card')
+  await button(h.chat(), '拒绝').props.onClick()
+  assert.match(text(h.chat()), /选择检查范围/)
+  const input = nodes(h.chat()).find(node => node.type === 'textarea')
+  input.props.onChange({ target: { value: '只检查显卡进程' } })
+  await poll(); await tick()
+  assert.equal(nodes(h.chat()).find(node => node.type === 'textarea').props.value, '只检查显卡进程')
+  assert.equal(h.publishedInteractions.length, 2)
+  await button(h.chat(), '提交回复').props.onClick()
+  assert.equal(h.chat(), null)
+  assert.deepEqual(JSON.parse(h.requests.filter(request => request.options.method === 'POST')[1].options.body),
+    { response: { answers: [{ id: 'mode', selected: [], custom: '只检查显卡进程' }] } })
+  h.cleanup()
+})
+
+test('native foreground cards are not duplicated and released/recovered requests automatically fall back into chat', async () => {
+  const run = { runId: 'r1', originSessionId: 'parent-1', scope: 'controller', state: 'waiting_approval', requests: [pendingApproval()], nativeRequestIds: ['request-a1'] }
+  const h = await harness({ activityRuns: [run] })
+  await h.mountMonitor()
+  assert.equal(h.chat(), null)
+  assert.equal(h.slots.get('dsh-server-hub-chat-interaction').options.select({ pendingInteraction: { kind: 'approval', sessionId: 'parent-1' } }), null)
+  run.nativeRequestIds = []
+  await [...h.intervals].find(([id]) => h.intervalDelays.get(id) === 3000)[1](); await tick()
+  assert.match(text(h.chat()), /等待人工审批/)
+  h.cleanup()
+  assert.equal(h.pendingInteractions.size, 0)
+  const restored = await harness({ activityRuns: [run] })
+  await restored.mountMonitor()
+  assert.match(text(restored.chat()), /等待人工审批/, 'reload reconstructs presentation from the durable task')
+  assert.equal(restored.requests.some(request => request.options.method === 'POST'), false)
+  restored.cleanup()
+})
+
+test('worker records cannot choose a controlling chat, and chat cards withdraw on terminal or externally answered snapshots', async () => {
+  const runs = [
+    { runId: 'worker-run', scope: 'worker', originSessionId: 'parent-1', state: 'waiting_approval', requests: [pendingApproval()] },
+    { runId: 'r1', scope: 'controller', originSessionId: 'other-parent', state: 'waiting_approval', requests: [pendingApproval()] },
+  ]
+  const h = await harness({ activityRuns: runs })
+  await h.mountMonitor()
+  assert.equal(h.chat(), null)
+  assert.match(text(h.chat('other-parent')), /等待人工审批/)
+  assert.equal(h.pendingInteractions.size, 1)
+  runs[1].requests = []; runs[1].state = 'running'
+  await [...h.intervals].find(([id]) => h.intervalDelays.get(id) === 3000)[1](); await tick()
+  assert.equal(h.pendingInteractions.size, 0, 'another tab or a remote withdrawal removes the card')
+  runs[1].requests = [pendingApproval()]; runs[1].state = 'interrupted'
+  await [...h.intervals].find(([id]) => h.intervalDelays.get(id) === 3000)[1](); await tick()
+  assert.equal(h.pendingInteractions.size, 0, 'terminal tasks never present stale approvals')
+  h.cleanup()
+})
+
+test('failed chat response shows an error on that card and leaves the human able to retry explicitly', async () => {
+  const h = await harness({ fetch: async (url, options) => ({ ok: options.method !== 'POST', status: options.method === 'POST' ? 400 : 200,
+    json: async () => url.includes('/overview') ? overview : url.endsWith('/activity') ? { runs: [
+      { runId: 'r1', originSessionId: 'parent-1', scope: 'controller', state: 'waiting_approval', requests: [pendingApproval()] },
+    ] } : url.endsWith('/connections') ? { connections: [] } : config }) })
+  await h.mountMonitor()
+  await button(h.chat(), '允许一次').props.onClick()
+  assert.match(text(h.chat()), /HTTP 400/)
+  assert.equal(button(h.chat(), '允许一次').props.disabled, false)
+  assert.equal(h.requests.filter(request => request.options.method === 'POST').length, 1)
+  assert.equal(h.modal(), null)
+  h.cleanup()
+})
+
+test('an already answered request in another tab immediately refreshes and withdraws the expired chat card', async () => {
+  let answeredElsewhere = false
+  const h = await harness({ fetch: async (url, options) => {
+    if (options.method === 'POST') {
+      answeredElsewhere = true
+      return { ok: false, status: 400, json: async () => ({ code: 'REMOTE_REQUEST_EXPIRED' }) }
+    }
+    const value = url.includes('/overview') ? overview : url.endsWith('/connections') ? { connections: [] } : { runs: answeredElsewhere ? [] : [
+      { runId: 'r1', originSessionId: 'parent-1', scope: 'controller', state: 'waiting_approval', requests: [pendingApproval()] },
+    ] }
+    return { ok: true, status: 200, json: async () => value }
+  } })
+  await h.mountMonitor()
+  assert.match(text(h.chat()), /等待人工审批/)
+  await button(h.chat(), '允许一次').props.onClick()
+  assert.equal(h.chat(), null)
+  assert.equal(h.requests.filter(request => request.options.method === 'POST').length, 1)
+  h.cleanup()
+})
+
+test('shell surfaces background/foreground-fallback approvals without opening Hub and keeps watching after close', async () => {
+  const runs = []
+  const h = await harness({ activityRuns: runs, initialConnections: [connection] })
+  await h.mountMonitor()
+  assert.equal(h.monitor(), null)
+  const poll = [...h.intervals].find(([id]) => h.intervalDelays.get(id) === 3000)[1]
+  runs.push({ runId: 'r1', targetId: connection.targetId, scope: 'controller', state: 'waiting_approval', requests: [pendingApproval()] })
+  await poll(); await tick()
+  assert.match(text(h.monitor()), /1 项审批／回复待处理/)
+  assert.equal(h.requests.some(request => request.options.method === 'POST'), false, 'observing never approves')
+  await button(h.monitor(), '处理远程请求（1）').props.onClick()
+  assert.match(text(h.modal()), /等待人工审批/)
+  assert.equal(h.monitor(), null, 'avoid covering an open dialog')
+  assert.equal([...h.intervalDelays.values()].filter(delay => delay === 3000).length, 1, 'modal shares the shell watcher')
+  button(h.modal(), '关闭').props.onClick()
+  assert.match(text(h.monitor()), /待处理/)
+  await poll(); await tick()
+  await button(h.monitor(), '处理远程请求（1）').props.onClick()
+  await button(h.modal(), '允许一次').props.onClick()
+  const posts = h.requests.filter(request => request.options.method === 'POST')
+  assert.equal(posts.length, 1)
+  assert.equal(posts[0].url, 'api/dsh-server-hub/remote/delegated/r1/requests/request-a1/response')
+  assert.deepEqual(JSON.parse(posts[0].options.body), { response: { outcome: 'allowed-once' } })
+  button(h.modal(), '关闭').props.onClick()
+  assert.equal(h.monitor(), null)
+  runs.push({ runId: 'r2', scope: 'worker', state: 'waiting_input', requests: [pendingQuestion()] })
+  await poll(); await tick()
+  assert.match(text(h.monitor()), /处理远程请求（1）/)
+  h.cleanup()
+  const count = h.requests.length
+  await poll(); await tick()
+  assert.equal(h.requests.length, count, 'disposed monitor must stop reading activity')
+  assert.equal(h.intervals.size, 0)
+})
+
+test('waiting runs without wire requests expose an actionable compatibility warning, never a fabricated approval', async () => {
+  const h = await harness({ activityRuns: [{ runId: 'old-run', scope: 'controller', state: 'waiting_approval' }] })
+  await h.mountMonitor()
+  await button(h.monitor(), '处理远程请求（1）').props.onClick()
+  assert.match(text(h.modal()), /没有可回复的请求/)
+  assert.match(text(h.modal()), /检查两端插件版本/)
+  assert.equal(nodes(h.modal()).some(node => node.type === 'button' && text(node) === '允许一次'), false)
+  h.cleanup()
+})
+
+test('activity failures retain pending reminders and disclose stale state until a successful refresh', async () => {
+  let fail = false
+  const h = await harness({ fetch: async url => {
+    if (url.endsWith('/activity') && fail) return { ok: false, status: 503, json: async () => ({}) }
+    const value = url.includes('/overview') ? overview : url.endsWith('/connections') ? { connections: [] } :
+      url.endsWith('/activity') ? { runs: [{ runId: 'r1', state: 'waiting_approval', requests: [pendingApproval()] }] } : config
+    return { ok: true, status: 200, json: async () => value }
+  } })
+  await h.mountMonitor()
+  const poll = [...h.intervals].find(([id]) => h.intervalDelays.get(id) === 3000)[1]
+  fail = true
+  await poll(); await tick()
+  assert.match(text(h.monitor()), /显示上次记录/)
+  await button(h.monitor(), '处理远程请求（1）').props.onClick()
+  assert.match(text(h.modal()), /HTTP 503/)
+  assert.match(text(h.modal()), /等待人工审批/)
+  button(h.modal(), '关闭').props.onClick()
+  fail = false
+  await poll(); await tick()
+  assert.doesNotMatch(text(h.monitor()), /显示上次记录/)
+  h.cleanup()
+})
+
+test('first activity failure is visible even without cached requests and recovers on retry', async () => {
+  let fail = true
+  const h = await harness({ fetch: async url => {
+    if (url.endsWith('/activity') && fail) throw new Error('Disconnected')
+    return { ok: true, status: 200, json: async () => url.includes('/overview') ? overview :
+      url.endsWith('/connections') ? { connections: [] } : { runs: [] } }
+  } })
+  await h.mountMonitor()
+  assert.match(text(h.monitor()), /可能有审批正在等待/)
+  assert.ok(button(h.monitor(), '检查远程请求'))
+  fail = false
+  await [...h.intervals].find(([id]) => h.intervalDelays.get(id) === 3000)[1](); await tick()
+  assert.equal(h.monitor(), null)
+  h.cleanup()
+})
+
+test('response success invalidates a slow activity GET so answered approvals never reappear', async () => {
+  const run = { runId: 'r1', scope: 'controller', state: 'waiting_approval', requests: [pendingApproval()] }
+  let holdNext = false, finish, oldSignal, answered = false
+  const h = await harness({ fetch: async (url, options) => {
+    if (url.endsWith('/activity') && holdNext) {
+      holdNext = false; oldSignal = options.signal
+      return new Promise(resolve => { finish = () => resolve({ ok: true, status: 200, json: async () => ({ runs: [structuredClone(run)] }) }) })
+    }
+    if (url.endsWith('/response')) answered = true
+    const fresh = { ...run, state: 'running', requests: [] }
+    return { ok: true, status: 200, json: async () => url.includes('/overview') ? overview :
+      url.endsWith('/connections') ? { connections: [] } : url.endsWith('/activity') ? { runs: [answered ? fresh : run] } :
+        url.endsWith('/response') ? { run: fresh } : config }
+  } })
+  await h.mountMonitor()
+  await button(h.monitor(), '处理远程请求（1）').props.onClick()
+  holdNext = true
+  await [...h.intervals].find(([id]) => h.intervalDelays.get(id) === 3000)[1](); await tick()
+  await button(h.modal(), '允许一次').props.onClick()
+  assert.equal(oldSignal.aborted, true)
+  assert.doesNotMatch(text(h.modal()), /等待人工审批/)
+  finish(); await tick()
+  assert.doesNotMatch(text(h.modal()), /等待人工审批/)
+  button(h.modal(), '关闭').props.onClick()
+  assert.equal(h.monitor(), null)
+  assert.equal(h.requests.filter(request => request.options.method === 'POST').length, 1)
+  h.cleanup()
+})
+
+test('monitor disposal aborts an in-flight activity read and ignores even an uncooperative late response', async () => {
+  let signal, finish
+  const h = await harness({ fetch: async (url, options) => {
+    if (url.endsWith('/activity')) {
+      signal = options.signal
+      return new Promise(resolve => { finish = () => resolve({ ok: true, status: 200, json: async () => ({ runs: [
+        { runId: 'r1', state: 'waiting_approval', requests: [pendingApproval()] },
+      ] }) }) })
+    }
+    return { ok: true, status: 200, json: async () => url.includes('/overview') ? overview : { connections: [] } }
+  } })
+  await h.mountMonitor()
+  assert.equal(signal.aborted, false)
+  h.cleanup()
+  assert.equal(signal.aborted, true)
+  finish(); await tick()
+  assert.equal(h.monitor(), null)
+  assert.equal(h.intervals.size, 0)
+})
 
 test('pending questions are visible outside folded history and human answers resume the owned delegated run', async () => {
   const run = { runId: 'r1', description: '检查GPU', scope: 'controller', state: 'waiting_input', requests: [pendingQuestion()] }
@@ -673,7 +941,7 @@ test('failed interaction response is not replayed and leaves its pending form av
     json: async () => url.endsWith('/activity') ? { runs: [{ runId: 'r1', scope: 'controller', state: 'waiting_approval', requests: [pendingApproval()] }] } : url.endsWith('/connections') ? { connections: [] } : config }) })
   await button(h.panel(), '远程管理').props.onClick()
   await button(h.modal(), '拒绝').props.onClick()
-  assert.match(text(h.modal()), /不会自动重发/)
+  assert.match(text(h.modal()), /确认原任务状态/)
   assert.match(text(h.modal()), /等待人工审批/)
   await tick()
   assert.equal(h.requests.filter(request => request.options.method === 'POST').length, 1)
