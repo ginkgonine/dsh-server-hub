@@ -107,7 +107,7 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
   }
   // Also run this fixture through the actual installed Cordis when requested:
   // DSH_TEST_CORDIS=<absolute Cordis module path> node --test test/remote-plugin.test.js
-  let runtime
+  let runtime, assemblePrompt
   if (cordis) {
     const root = new cordis.Context()
     t.after(() => root.fiber.dispose())
@@ -128,10 +128,13 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
     await bounded(fiber.await())
     assert.equal(fiber.state, 2, 'plugin must become ACTIVE, not PENDING/FAILED')
     runtime = { ...root.serverHubRemote, dispose: () => fiber.dispose() }
+    assemblePrompt = (assembly, context) => root.waterfall('system-prompt/assemble', assembly, context, () => Promise.resolve(assembly))
   } else {
     const dispose = await apply(ctx)
     assert.equal(typeof dispose, 'function', 'async apply must resolve to a valid Cordis disposer')
     runtime = { ...ctx.serverHubRemote, dispose }
+    assemblePrompt = (assembly, context) => hooks.has('system-prompt/assemble')
+      ? hooks.get('system-prompt/assemble')(assembly, context, () => Promise.resolve(assembly)) : Promise.resolve(assembly)
   }
   t.after(async () => { await runtime.dispose(); for (const cleanup of effects.reverse()) await cleanup?.() })
   const request = async (path, { method = 'GET', input, cookies = cookie, origin } = {}) => {
@@ -145,7 +148,9 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
       { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
     agent.status = 'idle'; agent.idle.resolve()
   }
-  return { ctx, runtime, tools, providers, cookie, endpoint, request, finish, prompts, notices, creates, credentials, agents, units, parent, hooks }
+  const assemble = ({ visibleTools = [...tools.values()], agent = parent } = {}) => assemblePrompt(
+    { sections: [], contexts: [], tools: visibleTools, variables: {} }, { agent })
+  return { ctx, runtime, tools, providers, cookie, endpoint, request, finish, prompts, notices, creates, credentials, agents, units, parent, hooks, assemble }
 }
 
 test('actual Cordis activates routes/tools and removes them on disposal', { skip: !process.env.DSH_TEST_CORDIS }, async t => {
@@ -340,6 +345,82 @@ test('name updates need only main admission and are visible to target lookup wit
   assert.equal(main.creates.length, 0)
   assert.equal(worker.creates.length, 0)
   assert.equal(JSON.stringify(rename.value).includes('v1.a.b'), false)
+})
+
+const instanceContext = assembly => assembly.contexts.find(section => section.name === 'server-hub:remote-instances')
+const instanceText = assembly => instanceContext(assembly) ? assembly.variables.server_hub_remote_instances : ''
+
+test('instance context is absent without connections and follows connect, rename, disconnect and reconnect', async t => {
+  const main = await fixture(t), worker = await fixture(t)
+  assert.equal(instanceText(await main.assemble()), '')
+  await worker.request('/config', { method: 'PUT', input: { enabled: true, workspaceIds: ['system'] } })
+  const connect = () => main.request('/connections', { method: 'POST', cookies: `${main.cookie}; ${worker.cookie}`,
+    input: { endpoint: worker.endpoint, name: '197服务器' } })
+  const result = await connect()
+  assert.equal(result.status, 200)
+  const path = `/connections/${result.value.connection.targetId}`
+  const expected = name => `Hub 已连接远程实例（1 个）：\n- ${name}\n\n用户要求在这些实例上执行任务时，使用 remote_agent_targets 查询目标和工作区，再通过 remote_agent 派发任务。`
+  let assembly = await main.assemble()
+  assert.equal(instanceText(assembly), expected('197服务器'))
+  assert.equal(instanceContext(assembly).text, '{{server_hub_remote_instances}}')
+  assert.equal((await main.request(path, { method: 'PUT', input: { name: '训练服务器' } })).status, 200)
+  assembly = await main.assemble()
+  assert.equal(instanceText(assembly), expected('训练服务器'))
+  assert.equal(assembly.contexts.length, 1)
+  assert.equal((await main.request(path, { method: 'DELETE' })).status, 200)
+  assembly = await main.assemble()
+  assert.deepEqual(assembly.contexts, [])
+  assert.deepEqual(assembly.variables, {})
+  assert.equal((await connect()).status, 200)
+  assert.equal(instanceText(await main.assemble()), expected('197服务器'))
+  assert.equal(main.prompts.length, 0)
+  assert.equal(worker.creates.length, 0)
+  await main.runtime.dispose()
+  assert.equal(instanceText(await main.assemble()), '')
+})
+
+test('instance context lists all names, falls back to endpoint, and never probes or exposes credentials', async t => {
+  const { main, worker, connection } = await connected(t)
+  const second = await fixture(t)
+  await second.request('/config', { method: 'PUT', input: { enabled: true, workspaceIds: ['system'] } })
+  assert.equal((await main.request('/connections', { method: 'POST', cookies: `${main.cookie}; ${second.cookie}`,
+    input: { endpoint: second.endpoint, name: '197服务器' } })).status, 200)
+  main.runtime.connections.fetchImpl = async () => assert.fail('prompt assembly must not contact a remote')
+  let text = instanceText(await main.assemble())
+  assert.match(text, /^Hub 已连接远程实例（2 个）：/)
+  assert.ok(text.includes(`- ${worker.endpoint}\n- 197服务器`))
+  assert.doesNotMatch(text, /v1\.a\.b|\/project\/system|targetId|workspaceId|别名|不保证/)
+  await main.request(`/connections/${connection.targetId}`, { method: 'PUT', input: { name: '197服务器' } })
+  text = instanceText(await main.assemble())
+  assert.equal(text.split('\n').filter(line => line === '- 197服务器').length, 2, 'do not hide duplicate names')
+})
+
+test('instance context is omitted when dispatch tools are unavailable, in child/worker agents or on storage failure', async t => {
+  const { main } = await connected(t)
+  for (const hidden of ['remote_agent', 'remote_agent_targets']) {
+    assert.equal(instanceText(await main.assemble({ visibleTools: [...main.tools.values()].filter(tool => tool.name !== hidden) })), '')
+  }
+  assert.equal(instanceText(await main.assemble({ agent: { session: { header: { origin: 'subagent' } } } })), '')
+  const workerAgent = { id: 'remote-context-test' }
+  main.runtime.worker.live.set('context-test', { agent: workerAgent })
+  try { assert.equal(instanceText(await main.assemble({ agent: workerAgent })), '') }
+  finally { main.runtime.worker.live.delete('context-test') }
+  main.ctx.credentials.listRecords = async () => { throw new Error('storage unavailable') }
+  assert.equal(instanceText(await main.assemble()), '')
+})
+
+test('real Cordis assembly hook renders instance names literally and is removed on disposal', {
+  skip: !process.env.DSH_TEST_CORDIS || !process.env.DSH_TEST_SYSTEM_PROMPT,
+}, async t => {
+  const cordis = await import(process.env.DSH_TEST_CORDIS)
+  const { renderContextSnapshot } = await import(process.env.DSH_TEST_SYSTEM_PROMPT)
+  const { main, connection } = await connected(t, cordis)
+  const name = '训练{{unknown_variable}}服务器'
+  assert.equal((await main.request(`/connections/${connection.targetId}`, { method: 'PUT', input: { name } })).status, 200)
+  const assembly = await main.assemble()
+  assert.ok(renderContextSnapshot(assembly).includes(`- ${name}`))
+  await main.runtime.dispose()
+  assert.equal(instanceText(await main.assemble()), '')
 })
 
 const questionPayload = () => ({ questions: [{ id: 'scope', question: '选择检查范围', options: [{ label: 'GPU进程' }, { label: '全部' }] }] })
