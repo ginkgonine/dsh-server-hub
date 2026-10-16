@@ -32,6 +32,35 @@ async function bounded(promise) {
   finally { clearTimeout(timer) }
 }
 
+function assertBackgroundGuidance(message) {
+  assert.match(message, /审批/)
+  assert.match(message, /提问|问题/)
+  assert.match(message, /完成|最终结果/)
+  assert.match(message, /自动/)
+  assert.match(message, /当前聊天/)
+  assert.match(message, /独立工作/)
+  assert.match(message, /结束本轮/)
+  assert.match(message, /sleep/i)
+  assert.match(message, /轮询|反复查询/)
+  assert.match(message, /查询状态|remote_agent_status/)
+  assert.match(message, /按需|询问进展|排障/)
+}
+
+function assertOverview(value, state) {
+  assert.equal(value.state, state)
+  for (const key of ['requests', 'output']) assert.equal(key in value, false, `model overview must omit ${key}`)
+  assertBackgroundGuidance(value.message)
+}
+
+function assertResponseAck(value, runId, requestId) {
+  assert.deepEqual(Object.keys(value).sort(), ['accepted', 'message', 'requestId', 'runId'])
+  assert.equal(value.runId, runId)
+  assert.equal(value.requestId, requestId)
+  assert.equal(value.accepted, true)
+  assert.match(value.message, /已|确认|成功/)
+  assertBackgroundGuidance(value.message)
+}
+
 /** Fake DSH Agent/model services; real network, storage contracts and plugin code. */
 async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inject, apply }, nativeConnection) {
   const tools = new Map(), providers = new Map(), hooks = new Map(), agents = new Map(), sessions = new Map(), credentials = new Map()
@@ -244,6 +273,13 @@ test('explicit existing-login connection and native one-shot provider report fin
   const submit = await main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: 'Server check', prompt: 'Inspect memory, CPU and Docker without changing anything' },
     { agent: { id: 'parent-1' }, callId: 'call-1', signal: new AbortController().signal })
   assert.equal(submit.accepted, true)
+  assertBackgroundGuidance(submit.message)
+  const exec = { agent: { id: 'parent-1' } }
+  const running = await main.tools.get('remote_agent_status').execute({ runId: submit.runId }, exec)
+  assertOverview(running, 'running')
+  const internalRunning = await main.runtime.controller.status(submit.runId, 'parent-1')
+  assert.deepEqual(internalRunning.requests, [])
+  assert.deepEqual(internalRunning.output, [])
   assert.equal(main.creates.length, 0, 'no shadow/local worker Agent')
   assert.equal(worker.creates.length, 1)
   assert.deepEqual(Object.keys(worker.creates[0]).sort(), ['cwd', 'sessionId'])
@@ -253,16 +289,48 @@ test('explicit existing-login connection and native one-shot provider report fin
   assert.equal(notice.sessionId, 'parent-1')
   assert.match(notice.content[0].text, /Memory 40%, CPU 8%, Docker healthy/)
   const result = await main.tools.get('remote_agent_status').execute({ runId: submit.runId }, { agent: { id: 'parent-1' } })
-  assert.equal(result.state, 'completed')
+  assertOverview(result, 'completed')
   assert.equal('prompt' in result, false)
+  const internalResult = await main.runtime.controller.status(submit.runId, 'parent-1')
+  assert.match(internalResult.output[0].text, /Memory 40%, CPU 8%, Docker healthy/)
+  assert.deepEqual(internalResult.requests, [])
   const activity = await main.request('/activity')
   assert.equal(activity.value.runs[0].runId, submit.runId)
   assert.equal(activity.value.runs[0].state, 'completed')
+  assert.deepEqual(activity.value.runs[0].output, internalResult.output)
+  assert.deepEqual(activity.value.runs[0].requests, internalResult.requests)
   assert.equal('prompt' in activity.value.runs[0], false)
+  const workerResult = await worker.request(`/runs/${submit.runId}`)
+  assert.deepEqual(workerResult.value.run.output, internalResult.output)
+  assert.deepEqual(workerResult.value.run.requests, [])
   await assert.rejects(main.tools.get('remote_agent_status').execute({ runId: submit.runId }, { agent: { id: 'another-parent' } }), /belong/)
   await main.runtime.controller.report(await main.runtime.store.get('masters', submit.runId))
   assert.equal(main.prompts.length, 1)
   assert.equal(worker.prompts.length, 1)
+})
+
+test('model status omits requests and output in every cached lifecycle state while internal/UI snapshots retain them', async t => {
+  const f = await fixture(t)
+  const approval = { id: 'request-cached', createdAt: 1, kind: 'approval', toolName: 'write', reason: 'Cached approval payload' }
+  const question = { id: 'request-question', createdAt: 1, kind: 'questions', ...questionPayload() }
+  for (const state of ['running', 'waiting_approval', 'waiting_input', 'completed', 'error', 'interrupted']) {
+    const runId = `cached-${state}`
+    const requests = state === 'waiting_approval' ? [approval] : state === 'waiting_input' ? [question] : []
+    const output = [{ type: 'text', text: `Private cached output: ${state}` }]
+    await f.runtime.store.put('masters', runId, { runId, targetId: 'cached-target', workspaceId: 'system', description: 'Cached task',
+      originSessionId: f.parent.id, background: false, state, createdAt: 1, updatedAt: 2, requests, output })
+    const overview = await f.tools.get('remote_agent_status').execute({ runId }, { agent: f.parent })
+    assertOverview(overview, state)
+    assert.equal(overview.runId, runId)
+    assert.equal(overview.updatedAt, 2)
+    const internal = await f.runtime.controller.status(runId, f.parent.id)
+    assert.deepEqual(internal.requests, requests)
+    assert.deepEqual(internal.output, output)
+    const ui = (await f.request('/activity')).value.runs.find(run => run.runId === runId)
+    assert.deepEqual(ui.requests, requests)
+    assert.deepEqual(ui.output, output)
+  }
+  assert.equal(f.prompts.length, 0, 'cached status reads must not dispatch notifications or invoke a model')
 })
 
 test('single-turn config persists independently of workspace changes and migrates old snapshots', async t => {
@@ -347,6 +415,27 @@ test('name updates need only main admission and are visible to target lookup wit
   assert.equal(JSON.stringify(rename.value).includes('v1.a.b'), false)
 })
 
+test('model tool descriptions explain automatic delivery, ending the turn and on-demand status', async t => {
+  const f = await fixture(t)
+  for (const name of ['remote_agent', 'remote_agent_status', 'remote_agent_respond']) {
+    const description = f.tools.get(name).description
+    assert.match(description, /approvals?/i)
+    assert.match(description, /questions?/i)
+    assert.match(description, /complet|final (?:results?|output)/i)
+    assert.match(description, /automatic/i)
+    assert.match(description, /(?:current|original|this) chat/i)
+    assert.match(description, /independent work/i)
+    assert.match(description, /end (?:the |your |this )?(?:current )?turn/i)
+    assert.match(description, /sleep/i)
+    assert.match(description, /poll/i)
+    if (name !== 'remote_agent_respond') assert.match(description, /on[- ]demand|progress|troubleshoot/i)
+  }
+  const status = f.tools.get('remote_agent_status').description
+  assert.match(status, /overview/i)
+  const respond = f.tools.get('remote_agent_respond').description
+  assert.match(respond, /acknowledg/i)
+})
+
 const instanceContext = assembly => assembly.contexts.find(section => section.name === 'server-hub:remote-instances')
 const instanceText = assembly => instanceContext(assembly) ? assembly.variables.server_hub_remote_instances : ''
 
@@ -359,20 +448,24 @@ test('instance context is absent without connections and follows connect, rename
   const result = await connect()
   assert.equal(result.status, 200)
   const path = `/connections/${result.value.connection.targetId}`
-  const expected = name => `Hub 已连接远程实例（1 个）：\n- ${name}\n\n用户要求在这些实例上执行任务时，使用 remote_agent_targets 查询目标和工作区，再通过 remote_agent 派发任务。`
+  const expectedPrefix = name => new RegExp(`^Hub 已连接远程实例（1 个）：\\n- ${name}\\n\\n用户要求在这些实例上执行任务时，使用 remote_agent_targets 查询目标和工作区，再通过 remote_agent 派发任务。`)
   let assembly = await main.assemble()
-  assert.equal(instanceText(assembly), expected('197服务器'))
+  assert.match(instanceText(assembly), expectedPrefix('197服务器'))
+  assertBackgroundGuidance(instanceText(assembly))
   assert.equal(instanceContext(assembly).text, '{{server_hub_remote_instances}}')
   assert.equal((await main.request(path, { method: 'PUT', input: { name: '训练服务器' } })).status, 200)
   assembly = await main.assemble()
-  assert.equal(instanceText(assembly), expected('训练服务器'))
+  assert.match(instanceText(assembly), expectedPrefix('训练服务器'))
+  assertBackgroundGuidance(instanceText(assembly))
   assert.equal(assembly.contexts.length, 1)
   assert.equal((await main.request(path, { method: 'DELETE' })).status, 200)
   assembly = await main.assemble()
   assert.deepEqual(assembly.contexts, [])
   assert.deepEqual(assembly.variables, {})
   assert.equal((await connect()).status, 200)
-  assert.equal(instanceText(await main.assemble()), expected('197服务器'))
+  const reconnected = instanceText(await main.assemble())
+  assert.match(reconnected, expectedPrefix('197服务器'))
+  assertBackgroundGuidance(reconnected)
   assert.equal(main.prompts.length, 0)
   assert.equal(worker.creates.length, 0)
   await main.runtime.dispose()
@@ -449,9 +542,14 @@ test('background questions cross real HTTP/SSE and ordinary reply resumes one or
   const [notification] = await bounded(notice)
   assert.match(notification.content[0].text, /选择检查范围/)
   assert.ok(notification.requestId.includes(status.requests[0].id))
+  const overview = await main.tools.get('remote_agent_status').execute({ runId: submit.runId }, exec)
+  assertOverview(overview, 'waiting_input')
+  const activity = await main.request('/activity')
+  assert.deepEqual(activity.value.runs[0].requests, status.requests)
+  assert.deepEqual(activity.value.runs[0].output, status.output)
   await assert.rejects(main.tools.get('remote_agent_respond').execute({ runId: submit.runId, requestId: status.requests[0].id, ...questionAnswer() }, { agent: { id: 'another' } }), /belong/)
   const response = await main.tools.get('remote_agent_respond').execute({ runId: submit.runId, requestId: status.requests[0].id, ...questionAnswer() }, exec)
-  assert.equal(response.state, 'running')
+  assertResponseAck(response, submit.runId, status.requests[0].id)
   assert.deepEqual(await bounded(original), questionAnswer())
   assert.equal(worker.creates.length, 1)
   assert.equal(worker.prompts.length, 1)
@@ -481,16 +579,74 @@ test('background write approval reaches the controller chat and its Agent can re
     assert.match(notification.content[0].text, /remote_agent_respond/)
     assert.doesNotMatch(notification.content[0].text, /Hub UI|requiresHuman|必须由人类/)
     assert.equal('requiresHuman' in status.requests[0], false)
+    assertOverview(await main.tools.get('remote_agent_status').execute({ runId: submit.runId }, exec), 'waiting_approval')
+    const activity = await main.request('/activity')
+    assert.deepEqual(activity.value.runs[0].requests, status.requests)
+    assert.deepEqual(activity.value.runs[0].output, status.output)
     const args = { runId: submit.runId, requestId: status.requests[0].id, outcome }
     await assert.rejects(main.tools.get('remote_agent_respond').execute(args, { agent: { id: 'other-parent' } }), /belong/)
     const response = await main.tools.get('remote_agent_respond').execute(args, exec)
-    assert.equal(response.state, 'running')
+    assertResponseAck(response, submit.runId, status.requests[0].id)
     assert.equal(await bounded(original), outcome)
     assert.equal(worker.creates.length, 1)
     assert.equal(worker.prompts.length, 1)
     worker.finish(agent.id)
     await controllerState(main.runtime.controller, submit.runId, 'completed')
   }
+})
+
+test('busy-parent fixture keeps queued approvals in original notifications; status is inert and respond only acknowledges', async t => {
+  const { main, worker, connection } = await connected(t)
+  // This fixture records queue admissions, not real DSH inbox consumption/model turns.
+  main.parent.status = 'running'
+  const exec = { agent: main.parent, callId: 'busy-parent', signal: new AbortController().signal }
+  const submit = await main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: '两次写入', prompt: 'write two configs' }, exec)
+  const agent = worker.agents.get(worker.creates[0].sessionId)
+  const checkpoint = deferred()
+  main.ctx.sessions.flush = async () => { await checkpoint.promise; return true }
+  const originals = [], requests = []
+  try {
+    for (const toolName of ['write-first', 'write-second']) {
+      const notice = once(main.notices, 'report')
+      originals.push(worker.hooks.get('approval/request')({ agent, toolName, reason: `Approve ${toolName}`, signal: new AbortController().signal }, () => assert.fail('worker must own approval')))
+      const [notification] = await bounded(notice)
+      assert.equal(notification.mode, 'queue')
+      assert.equal(notification.sessionId, main.parent.id)
+      // The request identity/payload comes from its original notification, never status.
+      const request = JSON.parse(notification.content[0].text.split('\n').at(-1))
+      assert.equal(request.toolName, toolName)
+      assert.ok(notification.requestId.endsWith(request.id))
+      requests.push(request)
+    }
+    const before = await main.runtime.store.get('masters', submit.runId)
+    assert.deepEqual(before.notifiedRequests || [], [], 'queued admissions have not passed the blocked checkpoint')
+    for (let i = 0; i < 2; i++) {
+      assertOverview(await main.tools.get('remote_agent_status').execute({ runId: submit.runId }, exec), 'waiting_approval')
+    }
+    assert.equal(main.parent.status, 'running', 'fixture parent is still busy; no queued prompt was consumed')
+    assert.equal(main.prompts.length, 2, 'status must not submit another prompt')
+    assert.deepEqual((await main.runtime.store.get('masters', submit.runId)).notifiedRequests || [], before.notifiedRequests || [], 'status must not mark queued notifications as handled')
+  } finally { checkpoint.resolve() }
+
+  const first = await main.tools.get('remote_agent_respond').execute({ runId: submit.runId, requestId: requests[0].id, outcome: 'allowed-once' }, exec)
+  assertResponseAck(first, submit.runId, requests[0].id)
+  assert.equal(JSON.stringify(first).includes(requests[1].id), false, 'ack must not leak another queued approval')
+  assert.equal(await bounded(originals[0]), 'allowed-once')
+  const internal = await main.runtime.controller.status(submit.runId, main.parent.id)
+  assert.equal(internal.state, 'waiting_approval')
+  assert.deepEqual(internal.requests, [requests[1]], 'internal status retains the other approval')
+  assert.deepEqual((await main.request('/activity')).value.runs[0].requests, [requests[1]], 'UI data retains the other approval')
+  assertOverview(await main.tools.get('remote_agent_status').execute({ runId: submit.runId }, exec), 'waiting_approval')
+  assert.equal(main.prompts.length, 2, 'neither status nor respond duplicates admitted notifications')
+  const second = await main.tools.get('remote_agent_respond').execute({ runId: submit.runId, requestId: requests[1].id, outcome: 'rejected' }, exec)
+  assertResponseAck(second, submit.runId, requests[1].id)
+  assert.equal(await bounded(originals[1]), 'rejected')
+  const final = once(main.notices, 'report')
+  worker.finish(agent.id, 'Both approval decisions received')
+  const [notification] = await bounded(final)
+  assert.match(notification.content[0].text, /Both approval decisions received/)
+  assert.equal(main.prompts.length, 3, 'two original approvals and one eventual result')
+  assert.equal(worker.prompts.length, 1, 'same original remote model turn')
 })
 
 test('foreground questions and approvals return control to the Agent instead of waiting on a GUI or deadlocking', async t => {
@@ -538,6 +694,11 @@ test('same task identity deduplicates at both ends; revoked workspace cannot sta
   await assert.rejects(main.tools.get('remote_agent').execute({ ...args, idempotencyKey: 'different-task' }, exec), /拒绝派单/)
   assert.equal(worker.creates.length, 1)
   assert.equal(worker.prompts.length, 1)
-  await main.tools.get('remote_agent_interrupt').execute({ runId: first.runId }, exec)
+  const interrupted = await main.tools.get('remote_agent_interrupt').execute({ runId: first.runId }, exec)
+  assertOverview(interrupted, 'interrupted')
+  assertOverview(await main.tools.get('remote_agent_status').execute({ runId: first.runId }, exec), 'interrupted')
+  const internal = await main.runtime.controller.status(first.runId, 'parent-1')
+  assert.deepEqual(internal.requests, [])
+  assert.ok(Array.isArray(internal.output))
   assert.equal((await worker.runtime.worker.get(first.runId)).state, 'interrupted')
 })

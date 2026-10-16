@@ -13,6 +13,9 @@ export const inject = ['webServer', 'connection', 'storage', 'storage.backend.js
 const object = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false })
 const text = { type: 'string' }
 const output = { schema: { type: 'object' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] }
+const backgroundGuidance = '审批、提问和最终结果都会自动送到当前聊天，由主控在这里询问用户并回传决定，无需打开 Hub 或远程实例。用户询问进展或需要排查异常时可以按需查询状态；不要为等待远程任务而 sleep 或反复查询。没有其他独立工作时，请直接结束本轮回复，等待自动通知唤醒。'
+// Model tools observe task state, but must not deliver queued interactions/results a second time.
+const taskOverview = run => Object.fromEntries(Object.entries(run).filter(([key]) => !['requests', 'output'].includes(key)))
 
 /** No hand-written pairing/config: every instance has UI settings, off until opted in. */
 export async function apply(ctx) {
@@ -51,7 +54,7 @@ export async function apply(ctx) {
         } catch { return { targetId, name: connection.name || '', endpoint: connection.endpoint, online: false, workspaces: [], message: '连接不可用；请打开远程实例登录，并在 Hub 中重新连接远控' } }
       })) }
     }, true)
-    register('remote_agent', 'Dispatch a task to a remote Agent on a target instance and workspace. The remote Agent does not share this conversation history, so include all necessary context in prompt. Runs in the background by default with an automatic completion report, or waits for the result when configured. Avoid repeated status polling and duplicate submissions.',
+    register('remote_agent', 'Dispatch a task to a remote Agent on a target instance and workspace. The remote Agent does not share this conversation history, so include all necessary context in prompt. Runs in the background by default, or waits for the result when configured. Background questions, approvals and final results automatically arrive in this chat; handle approvals here with the user. If no independent work remains, end your turn and let a notification wake you. Do not sleep or poll to wait for remote work or capture approvals. Query status on demand when the user asks about progress or to diagnose a problem. Avoid duplicate submissions.',
       object({ targetId: text, workspaceId: text, description: text, prompt: text, run_in_background: { type: 'boolean' }, idempotencyKey: text }, ['targetId', 'workspaceId', 'description', 'prompt']), async (args, exec) => {
         if (exec.agent.session?.header?.origin === 'subagent') throw new Error('第一版远程派出仅支持普通主控会话，不支持子 Agent 再派远程 Agent')
         if ([args.description, args.prompt].some(value => typeof value !== 'string' || !value.trim()) || args.description.length > 500 || args.prompt.length > 100000) throw new Error('Provide a bounded, nonempty task description and prompt')
@@ -87,7 +90,7 @@ export async function apply(ctx) {
             if (['completed', 'error', 'interrupted'].includes(pending.state)) return { runId, ...(await run.result) }
             yielded = true
             reportInBackground()
-            return { ...pending, message: '远程任务需要回复，先在当前聊天向用户说明并询问决定，再用 remote_agent_respond 回传。原任务保留，完成后自动回报。' }
+            return { ...pending, message: `远程任务需要回复，先在当前聊天向用户说明并询问决定，再用 remote_agent_respond 回传。原任务保留。${backgroundGuidance}` }
           } finally {
             exec.signal?.removeEventListener('abort', abort)
             waiting.abort()
@@ -96,21 +99,26 @@ export async function apply(ctx) {
         }
         reportInBackground()
         const current = await controller.status(runId, String(exec.agent.id))
-        return { runId, accepted: true, state: current.state, message: '已派出远程子 Agent；完成后自动回报，不必等待或反复查询。' }
+        return { runId, accepted: true, state: current.state, message: `已派出远程子 Agent。${backgroundGuidance}` }
       })
-    register('remote_agent_status', 'Check the cached status, result, and pending requests of a remote Agent task. Call only when needed. Reply to waiting_input with answers or waiting_approval with an outcome through remote_agent_respond, following the user\'s instructions. Ask the user in the current chat when a decision is needed. connection_lost means the connection was lost; do not resubmit.',
-      object({ runId: text }, ['runId']), (args, exec) => controller.status(args.runId, String(exec.agent.id)), true)
+    register('remote_agent_status', 'Check a remote task\'s cached state and timing on demand when the user asks about progress or to diagnose a problem. This is an overview, not a live progress probe; it does not return approval/question payloads or final output. Those arrive automatically in the current chat. Do not poll or sleep to wait for them. If no independent work remains, end your turn. connection_lost means the connection was lost; do not resubmit.',
+      object({ runId: text }, ['runId']), async (args, exec) => ({
+        ...taskOverview(await controller.status(args.runId, String(exec.agent.id))), message: backgroundGuidance,
+      }), true)
     const answer = object({ id: text, selected: { type: 'array', items: text }, custom: text }, ['id', 'selected'])
-    register('remote_agent_respond', 'Reply to your remote task\'s pending request. For questions or plan reviews pass answers; for permission requests pass outcome: allowed-once, rejected, or cancelled. Explain the remote operation and ask the user in the current chat (plain text or ask_user_question) when their decision is needed, then relay that decision. Match the existing runId/requestId; this continues the original task.',
+    register('remote_agent_respond', 'Reply to your remote task\'s pending request. For questions or plan reviews pass answers; for permission requests pass outcome: allowed-once, rejected, or cancelled. Explain the remote operation and ask the user in the current chat (plain text or ask_user_question) when their decision is needed, then relay that decision. Match the existing runId/requestId from the notification or foreground dispatch response; this continues the original task. Success returns only an acknowledgement. Further questions, approvals and final results arrive automatically in this chat. If no independent work remains, end your turn; do not sleep or poll.',
       object({ runId: text, requestId: text, answers: { type: 'array', items: answer },
         outcome: { type: 'string', enum: ['allowed-once', 'rejected', 'cancelled'] } }, ['runId', 'requestId']),
-      (args, exec) => {
+      async (args, exec) => {
         if (Object.hasOwn(args, 'answers') === Object.hasOwn(args, 'outcome')) throw new Error('Provide exactly one of answers or outcome')
-        return controller.respond(args.runId, args.requestId, Object.hasOwn(args, 'outcome') ? { outcome: args.outcome } : { answers: args.answers },
+        await controller.respond(args.runId, args.requestId, Object.hasOwn(args, 'outcome') ? { outcome: args.outcome } : { answers: args.answers },
           String(exec.agent.id), { signal: exec.signal })
+        return { runId: args.runId, requestId: args.requestId, accepted: true, message: `回复已回传。${backgroundGuidance}` }
       })
     register('remote_agent_interrupt', 'Request interruption of a remote Agent\'s current turn by runId. Does not stop external processes or containers.',
-      object({ runId: text }, ['runId']), (args, exec) => controller.interrupt(args.runId, String(exec.agent.id)))
+      object({ runId: text }, ['runId']), async (args, exec) => ({
+        ...taskOverview(await controller.interrupt(args.runId, String(exec.agent.id))), message: backgroundGuidance,
+      }))
     // Read local connections on each assembly: no remote probes, cached names, or extra model turns.
     ctx.effect(() => ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
       const assembly = await next()
@@ -122,7 +130,7 @@ export async function apply(ctx) {
       if (closed || !targets.length) return assembly
       const names = targets.map(target => `- ${target.name || target.endpoint}`).join('\n')
       // Interpolate once through a variable so names containing {{...}} stay literal data.
-      assembly.variables.server_hub_remote_instances = `Hub 已连接远程实例（${targets.length} 个）：\n${names}\n\n用户要求在这些实例上执行任务时，使用 remote_agent_targets 查询目标和工作区，再通过 remote_agent 派发任务。`
+      assembly.variables.server_hub_remote_instances = `Hub 已连接远程实例（${targets.length} 个）：\n${names}\n\n用户要求在这些实例上执行任务时，使用 remote_agent_targets 查询目标和工作区，再通过 remote_agent 派发任务。\n\n后台远程任务：${backgroundGuidance}`
       assembly.contexts.push({ name: 'server-hub:remote-instances', text: '{{server_hub_remote_instances}}' })
       return assembly
     }), 'server-hub: connected instance context')
