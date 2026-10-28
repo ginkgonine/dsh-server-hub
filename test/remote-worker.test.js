@@ -297,6 +297,68 @@ test('startup and checkpoint failures settle once and do not retry model admissi
   })
 })
 
+test('failed checkpoint or prompt publishes error immediately while drain waits for cancelled Agent idle', async t => {
+  for (const phase of ['checkpoint-before-prompt', 'checkpoint-after-prompt', 'prompt']) await t.test(phase, async t => {
+    const f = fixture(t), create = f.ctx.sessionController.create, prompt = f.ctx.sessionController.prompt
+    f.ctx.sessionController.create = async input => {
+      const created = await create(input), agent = f.agents.get(created.sessionId)
+      agent.cancel = cause => { f.cancels.push({ id: agent.id, cause }) }
+      return created
+    }
+    let checkpoints = 0
+    f.ctx.sessions.flush = async () => {
+      checkpoints++
+      return phase === 'prompt' || (phase === 'checkpoint-after-prompt' && checkpoints === 1)
+    }
+    f.ctx.sessionController.prompt = async input => {
+      await prompt(input)
+      if (phase === 'prompt') throw new Error('private prompt failure detail')
+      return { accepted: true }
+    }
+    let publishedStop
+    f.worker.events.on('changed', runId => {
+      if (f.data.get(runId)?.state === 'error') publishedStop = f.worker.stopping.get(runId)
+    })
+    const result = await f.worker.start(f.input), agent = f.agents.get(result.sessionId)
+    assert.equal(result.state, 'error', 'failure admission must not wait for Agent idle')
+    assert.equal(result.stopReason, 'error')
+    assert.doesNotMatch(result.diagnostic, /private prompt failure detail/)
+    assert.equal(f.cancels.length, 1)
+    const stopping = f.worker.stopping.get(result.runId)
+    assert.ok(stopping)
+    assert.equal(publishedStop, stopping, 'drain barrier is registered before publishing the terminal error')
+    assert.equal(f.archives.length, 0)
+    let drained = false
+    const drain = f.worker.drain(result.runId).then(run => { drained = true; return run })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(drained, false)
+    assert.equal((await f.worker.done(result.runId)).state, 'error')
+    assert.equal((await f.worker.start(f.input)).state, 'error', 'duplicate admission never retries the model')
+    // The unrelated durable tombstone proves idle waiting does not hold serial().
+    assert.equal((await f.worker.cancel('unrelated-run')).cancelledBeforeStart, true)
+    assert.equal(drained, false)
+    await f.worker.close()
+    assert.equal(drained, false, 'module close does not block on cancelled model quiescence')
+    agent.status = 'idle'
+    agent.idle.resolve()
+    assert.equal((await drain).state, 'error')
+    assert.equal(f.worker.stopping.size, 0)
+    assert.deepEqual(f.archives, [result.sessionId])
+    assert.equal(f.creates.length, 1)
+    assert.equal(f.prompts.length, phase === 'checkpoint-before-prompt' ? 0 : 1)
+  })
+})
+
+test('failed startup with an already-idle cancelled Agent archives only after the error journal', async t => {
+  const f = fixture(t)
+  f.ctx.sessions.flush = async () => false
+  const result = await f.worker.start(f.input)
+  assert.equal(result.state, 'error')
+  assert.equal((await f.worker.drain(result.runId)).state, 'error')
+  assert.deepEqual(f.archives, [result.sessionId])
+  assert.equal(f.worker.stopping.size, 0)
+})
+
 test('archive presentation failures cannot change a completed task outcome', async t => {
   const f = fixture(t)
   const archiving = deferred()

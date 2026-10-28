@@ -3,6 +3,7 @@ import { RemoteStore } from './store.js'
 import { RemoteConnections } from './auth.js'
 import { RemoteWorker } from './worker.js'
 import { RemoteController } from './controller.js'
+import { RemoteDispatch } from './dispatch.js'
 import { createRemoteRoute, REMOTE_ROUTE } from './routes.js'
 
 export const name = 'dsh-server-hub-remote'
@@ -23,6 +24,7 @@ export async function apply(ctx) {
   const connections = new RemoteConnections(ctx)
   const worker = new RemoteWorker(ctx, store)
   const controller = new RemoteController(ctx, store, connections)
+  const dispatch = new RemoteDispatch(ctx, store, controller)
   let closed = false
   const dispose = async () => {
     if (closed) return
@@ -54,59 +56,28 @@ export async function apply(ctx) {
         } catch { return { targetId, name: connection.name || '', endpoint: connection.endpoint, online: false, workspaces: [], message: '连接不可用；请打开远程实例登录，并在 Hub 中重新连接远控' } }
       })) }
     }, true)
-    register('remote_agent', 'Dispatch a task to a remote Agent on a target instance and workspace. The remote Agent does not share this conversation history, so include all necessary context in prompt. Runs in the background by default, or waits for the result when configured. Background questions, approvals and final results automatically arrive in this chat; handle approvals here with the user. If no independent work remains, end your turn and let a notification wake you. Do not sleep or poll to wait for remote work or capture approvals. Query status on demand when the user asks about progress or to diagnose a problem. Avoid duplicate submissions.',
-      object({ targetId: text, workspaceId: text, description: text, prompt: text, run_in_background: { type: 'boolean' }, idempotencyKey: text }, ['targetId', 'workspaceId', 'description', 'prompt']), async (args, exec) => {
+    register('remote_agent', 'Dispatch a task to a remote Agent on a target instance and workspace. The remote Agent does not share this conversation history, so include all necessary context in prompt. Runs in the background by default, or waits for the result in the current turn when single-turn mode is enabled or run_in_background is false. Single-turn mode takes precedence over run_in_background:true. A foreground question or approval returns control to this chat and keeps the original task running in the background. Background questions, approvals and final results automatically arrive in this chat; handle approvals here with the user. If no independent work remains, end your turn and let a notification wake you. Do not sleep or poll to wait for remote work or capture approvals. Query status on demand when the user asks about progress or to diagnose a problem. Avoid duplicate submissions.',
+      object({ targetId: text, workspaceId: text, description: text, prompt: text, run_in_background: { type: 'boolean', description: 'Defaults to background; false waits for the result. The user single-turn setting always takes precedence.' }, idempotencyKey: text }, ['targetId', 'workspaceId', 'description', 'prompt']), async (args, exec) => {
         if (exec.agent.session?.header?.origin === 'subagent') throw new Error('第一版远程派出仅支持普通主控会话，不支持子 Agent 再派远程 Agent')
         if ([args.description, args.prompt].some(value => typeof value !== 'string' || !value.trim()) || args.description.length > 500 || args.prompt.length > 100000) throw new Error('Provide a bounded, nonempty task description and prompt')
         const runId = controller.runId(String(exec.agent.id), args.idempotencyKey || String(exec.callId || randomUUID()))
-        // This user setting is authoritative for new tasks. A retry retains the
-        // task's original delivery mode, so a setting change cannot double-report.
-        const existing = await store.get('masters', runId)
-        const background = existing ? existing.background !== false : !store.getConfig().waitForResult && args.run_in_background !== false
-        const ac = new AbortController()
-        const abort = () => ac.abort(exec.signal.reason)
-        if (exec.signal?.aborted) throw new Error('Task submission cancelled')
-        exec.signal?.addEventListener('abort', abort, { once: true })
-        let run, started = false
-        try {
-          run = await ctx.subagents.start('server-hub-remote', { parent: exec.agent, signal: ac.signal,
-            label: args.description, prompt: [{ type: 'text', text: JSON.stringify({ ...args, runId, background }) }] })
-          started = true
-        } finally { if (background || !started) exec.signal?.removeEventListener('abort', abort) }
-        const reportInBackground = () => run.result.then(async () => {
-          try { await controller.report(await store.get('masters', runId)) } finally { await run.dispose() }
-        }).catch(() => {})
-        if (!background) {
-          const waiting = new AbortController()
-          let yielded = false
-          try {
-            const next = await Promise.race([
-              run.result.then(result => ({ result })),
-              controller.waitForInteraction(runId, String(exec.agent.id), AbortSignal.any([exec.signal, waiting.signal]))
-                .then(async pending => pending ? { pending } : { result: await run.result }),
-            ])
-            if (next.result) return { runId, ...next.result }
-            const pending = await controller.yieldForInput(runId, String(exec.agent.id))
-            if (['completed', 'error', 'interrupted'].includes(pending.state)) return { runId, ...(await run.result) }
-            yielded = true
-            reportInBackground()
-            return { ...pending, message: `远程任务需要回复，先在当前聊天向用户说明并询问决定，再用 remote_agent_respond 回传。原任务保留。${backgroundGuidance}` }
-          } finally {
-            exec.signal?.removeEventListener('abort', abort)
-            waiting.abort()
-            if (!yielded) await run.dispose()
-          }
+        const background = !store.getConfig().waitForResult && args.run_in_background !== false
+        const current = await dispatch.start({ ...args, runId, background }, exec.agent, exec.signal)
+        if (!current.background && !current.reused) {
+          const next = await dispatch.waitForResult(current, exec.agent, exec.signal, exec.callId)
+          if (next.result) return { runId, ...next.result }
+          return { ...next.pending, message: `远程任务需要回复，先在当前聊天向用户说明并询问决定，再用 remote_agent_respond 回传。原任务已保留并转为后台执行。${backgroundGuidance}` }
         }
-        reportInBackground()
-        const current = await controller.status(runId, String(exec.agent.id))
-        return { runId, accepted: true, state: current.state, message: `已派出远程子 Agent。${backgroundGuidance}` }
+        return { runId, accepted: true, state: current.state, ...(current.reused ? { reused: true } : {}),
+          message: current.reused && !current.background ? '原远程任务沿用原等待调用接收结果，无需重新派单。' :
+            `${current.reused ? '已保留原远程任务。' : '已派出远程子 Agent。'}${backgroundGuidance}` }
       })
     register('remote_agent_status', 'Check a remote task\'s cached state and timing on demand when the user asks about progress or to diagnose a problem. This is an overview, not a live progress probe; it does not return approval/question payloads or final output. Those arrive automatically in the current chat. Do not poll or sleep to wait for them. If no independent work remains, end your turn. connection_lost means the connection was lost; do not resubmit.',
       object({ runId: text }, ['runId']), async (args, exec) => ({
         ...taskOverview(await controller.status(args.runId, String(exec.agent.id))), message: backgroundGuidance,
       }), true)
     const answer = object({ id: text, selected: { type: 'array', items: text }, custom: text }, ['id', 'selected'])
-    register('remote_agent_respond', 'Reply to your remote task\'s pending request. For questions or plan reviews pass answers; for permission requests pass outcome: allowed-once, rejected, or cancelled. Explain the remote operation and ask the user in the current chat (plain text or ask_user_question) when their decision is needed, then relay that decision. Match the existing runId/requestId from the notification or foreground dispatch response; this continues the original task. Success returns only an acknowledgement. Further questions, approvals and final results arrive automatically in this chat. If no independent work remains, end your turn; do not sleep or poll.',
+    register('remote_agent_respond', 'Reply to your remote task\'s pending request. For questions or plan reviews pass answers; for permission requests pass outcome: allowed-once, rejected, or cancelled. Explain the remote operation and ask the user in the current chat (plain text or ask_user_question) when their decision is needed, then relay that decision. Match the existing runId/requestId from the chat notification; this continues the original task. Success returns only an acknowledgement. Further questions, approvals and final results arrive automatically in this chat. If no independent work remains, end your turn; do not sleep or poll.',
       object({ runId: text, requestId: text, answers: { type: 'array', items: answer },
         outcome: { type: 'string', enum: ['allowed-once', 'rejected', 'cancelled'] } }, ['runId', 'requestId']),
       async (args, exec) => {

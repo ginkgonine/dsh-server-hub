@@ -4,8 +4,13 @@ import { createHash } from 'node:crypto'
 import { canonicalEndpoint, cookieForEndpoint, RemoteConnections } from '../src/remote/auth.js'
 
 const endpoint = 'http://127.0.0.1:3081'
-const cookieName = value => `dsh-auth-${createHash('sha256').update(new URL(value).host).digest('base64url')}`
-const nativeCookie = (value, label = 'test-only-cookie') => `${cookieName(value)}=v1.${Buffer.from(JSON.stringify({ authority: new URL(value).host, label })).toString('base64url')}.dGVzdC1vbmx5LXNpZ25hdHVyZQ`
+const audience = (value, legacy = false) => {
+  const url = new URL(value)
+  return !legacy && url.protocol === 'https:' ? url.origin : url.host
+}
+const nameForAudience = value => `dsh-auth-${createHash('sha256').update(value).digest('base64url')}`
+const cookieName = (value, legacy = false) => nameForAudience(audience(value, legacy))
+const nativeCookie = (value, label = 'test-only-cookie', legacy = false) => `${cookieName(value, legacy)}=v1.${Buffer.from(JSON.stringify({ authority: audience(value, legacy), label })).toString('base64url')}.dGVzdC1vbmx5LXNpZ25hdHVyZQ`
 const expectedCookie = nativeCookie(endpoint)
 const req = () => ({ headers: { host: '127.0.0.1:3080', cookie: `${nativeCookie('http://127.0.0.1:3080', 'main')}; ${expectedCookie}; unrelated=do-not-forward` } })
 const defaultCatalog = () => ({ version: 1, instanceId: 'worker-instance', enabled: true, workspaces: [{ id: 'maintenance', title: 'Maintenance', path: '/srv/maintenance' }] })
@@ -64,6 +69,93 @@ test('explicit connection extracts only the target authority native cookie, with
   assert.throws(() => cookieForEndpoint({ headers: { host: '127.0.0.1:3080', cookie: `${expectedCookie}; ${expectedCookie}` } }, endpoint), error => error.code === 'REMOTE_LOGIN_REQUIRED')
 })
 
+test('cookie selection supports current HTTP/HTTPS and legacy HTTPS with canonical audiences', async t => {
+  for (const [target, host, legacy] of [
+    [endpoint, '127.0.0.1:3080', false],
+    ['https://127.0.0.1:3081', '127.0.0.1:3080', false],
+    ['https://127.0.0.1:3081', '127.0.0.1:3080', true],
+    ['http://localhost:80', 'localhost:3080', false],
+    ['https://localhost:443', 'localhost:3080', false],
+    ['https://localhost:443', 'localhost:3080', true],
+    ['https://[::1]:3081', '[::1]:3080', false],
+    ['https://[::1]:3081', '[::1]:3080', true],
+  ]) await t.test(`${target} ${legacy ? 'legacy' : 'current'}`, async () => {
+    const cookie = nativeCookie(target, 'test-only-target', legacy)
+    const request = { headers: new Headers({ host, cookie: `unrelated=ignore; ${cookie}` }) }
+    assert.equal(cookieForEndpoint(request, target), cookie)
+    const f = fixture()
+    const connected = await f.connections.connect(request, { endpoint: target })
+    const [record] = f.records.values()
+    assert.equal(`${record.payload.cookieName}=${record.payload.cookieValue}`, cookie)
+    assert.deepEqual(await f.connections.get(connected.id), { endpoint: canonicalEndpoint(target), cookie, instanceId: 'worker-instance' })
+    assert.deepEqual(await f.connections.list(), [connected])
+    noPrivateFields(connected)
+    await f.connections.request(connected.id, '/agents')
+    assert.equal(f.calls.length, 2)
+    for (const call of f.calls) assert.equal(call.options.headers.cookie, cookie)
+  })
+})
+
+test('HTTPS prefers only the new audience when both browser cookie names exist, regardless of order', async t => {
+  const target = 'https://127.0.0.1:3081'
+  const current = nativeCookie(target, 'test-only-current')
+  const legacy = nativeCookie(target, 'test-only-legacy', true)
+  for (const cookies of [[legacy, current], [current, legacy]]) await t.test(cookies[0] === current ? 'current first' : 'legacy first', async () => {
+    const request = { headers: { host: req().headers.host, cookie: cookies.join('; ') } }
+    assert.equal(cookieForEndpoint(request, target), current)
+    const f = fixture()
+    const connected = await f.connections.connect(request, { endpoint: target })
+    assert.equal((await f.connections.get(connected.id)).cookie, current)
+    assert.equal(f.calls[0].options.headers.cookie, current)
+  })
+  // An invalid or duplicated *unselected* legacy cookie cannot override the current login.
+  assert.equal(cookieForEndpoint({ headers: { host: req().headers.host, cookie: `${legacy}; ${legacy}; ${current}` } }, target), current)
+  assert.equal(cookieForEndpoint({ headers: { host: req().headers.host, cookie: `${cookieName(target, true)}=v2.operator.signature; ${current}` } }, target), current)
+})
+
+test('ambiguous, malformed and non-browser cookies fail closed without a legacy downgrade or network access', async t => {
+  const target = 'https://127.0.0.1:3081'
+  const current = nativeCookie(target)
+  const legacy = nativeCookie(target, 'test-only-legacy', true)
+  for (const [label, cookie] of [
+    ['duplicate current', `${current}; ${current}; ${legacy}`],
+    ['conflicting current', `${current}; ${nativeCookie(target, 'test-only-other')}; ${legacy}`],
+    ['empty current', `${cookieName(target)}=; ${legacy}`],
+    ['malformed current', `${cookieName(target)}=invalid; ${legacy}`],
+    ['operator current cannot downgrade', `${cookieName(target)}=v2.operator.signature; ${legacy}`],
+    ['duplicate legacy', `${legacy}; ${legacy}`],
+    ['operator legacy', `${cookieName(target, true)}=v2.operator.signature`],
+    ['bearer is not a browser login', ''],
+    ['cookie prefix is not exact', `${cookieName(target)}-suffix=v1.payload.signature`],
+    ['cookie value delimiter', `${cookieName(target)}=v1.payload.signature=extra`],
+    ['cookie value injection', `${cookieName(target)}=v1.payload.signature\r\nInjected: value`],
+  ]) await t.test(label, async () => {
+    const f = fixture()
+    const request = { headers: { host: req().headers.host, cookie, authorization: 'Bearer v2.operator.signature' } }
+    await rejectsCode(f.connections.connect(request, { endpoint: target }), 'REMOTE_LOGIN_REQUIRED')
+    assert.equal(f.calls.length, 0)
+    assert.equal(f.records.size, 0)
+  })
+})
+
+test('cookie candidates never include another target port, hostname or HTTP origin audience', async t => {
+  for (const [target, cookie] of [
+    [endpoint, nativeCookie('http://127.0.0.1:3082')],
+    [endpoint, `${nameForAudience(new URL(endpoint).origin)}=v1.payload.signature`],
+    [endpoint, nativeCookie('https://127.0.0.1:3081')],
+    ['https://127.0.0.1:3081', nativeCookie('https://127.0.0.1:3082')],
+    ['https://127.0.0.1:3081', nativeCookie('https://127.0.0.1:3082', 'test-only-other-port', true)],
+    ['https://127.0.0.1:3081', nativeCookie('https://localhost:3081')],
+    ['https://127.0.0.1:3081', nativeCookie('https://localhost:3081', 'test-only-other-host', true)],
+  ]) await t.test(`${target} rejects ${cookie.split('=')[0]}`, async () => {
+    const f = fixture()
+    await rejectsCode(f.connections.connect({ headers: { host: req().headers.host, cookie } }, { endpoint: target }), 'REMOTE_LOGIN_REQUIRED')
+    assert.equal(f.calls.length, 0)
+    assert.equal(f.records.size, 0)
+  })
+  assert.throws(() => cookieForEndpoint({ headers: { host: 'localhost:3080', cookie: nativeCookie('https://127.0.0.1:3081') } }, 'https://127.0.0.1:3081'), error => error.code === 'REMOTE_HOSTNAME')
+})
+
 test('connect validates enabled catalog before privately persisting the exact target native login', async () => {
   const f = fixture()
   const connected = await f.connections.connect(req(), { endpoint: `${endpoint}/` })
@@ -84,6 +176,98 @@ test('connect validates enabled catalog before privately persisting the exact ta
   assert.equal(f.calls[0].options.redirect, 'error')
   assert.deepEqual(f.calls[0].options.headers, { cookie: expectedCookie, accept: 'application/json' })
   assert.ok(f.calls[0].options.signal instanceof AbortSignal)
+})
+
+test('previously saved host-only HTTPS grants survive recreation and migrate only on explicit reconnect', async () => {
+  const target = 'https://127.0.0.1:3081/'
+  const legacy = nativeCookie(target, 'test-only-saved', true)
+  const current = nativeCookie(target, 'test-only-current')
+  const suffix = createHash('sha256').update(target).digest('hex').slice(0, 24)
+  const id = `remote-${suffix}`
+  const key = `dsh-server-hub/remote-3080-${suffix}`
+  const f = fixture()
+  const { instanceId, workspaces } = defaultCatalog()
+  const saved = { kind: 'grant', payload: { version: 1, endpoint: target, instanceId, workspaces,
+    cookieName: cookieName(target, true), cookieValue: legacy.slice(legacy.indexOf('=') + 1), name: 'Saved worker' } }
+  f.records.set(key, structuredClone(saved))
+  // These private records must never be consulted to find or refresh this target's login.
+  f.records.set(key.replace('remote-3080-', 'remote-3082-'), structuredClone(saved))
+  f.records.set('other-plugin/private', { kind: 'grant', payload: { secret: 'do-not-forward' } })
+  const reads = []
+  const readRecord = f.ctx.credentials.readRecord
+  f.ctx.credentials.readRecord = async key => { reads.push(key); return readRecord(key) }
+  const [connected] = await f.connections.list()
+  assert.equal(connected.id, id)
+  assert.equal(connected.name, 'Saved worker')
+  assert.deepEqual(reads, [key])
+  assert.deepEqual(await f.connections.get(id), { endpoint: target, cookie: legacy, instanceId })
+  assert.equal(f.calls.length, 0)
+  assert.deepEqual(f.records.get(key), saved)
+  const recreated = new RemoteConnections(f.ctx, { fetchImpl: f.connections.fetchImpl })
+  await recreated.request(id, '/agents')
+  assert.equal(f.calls.at(-1).options.headers.cookie, legacy)
+  assert.deepEqual(f.records.get(key), saved)
+  const request = { headers: { host: req().headers.host, cookie: `${legacy}; ${current}` } }
+  assert.deepEqual(await recreated.connect(request, { endpoint: target }), connected)
+  assert.equal((await recreated.get(id)).cookie, current)
+  assert.equal(f.records.get(key).payload.cookieName, cookieName(target))
+  assert.equal(f.records.get(key).payload.name, 'Saved worker')
+  assert.deepEqual(f.records.get(key.replace('remote-3080-', 'remote-3082-')), saved)
+  assert.ok(reads.every(read => read === key))
+  assert.deepEqual(await new RemoteConnections(f.ctx).list(), [connected])
+  await recreated.request(id, '/agents')
+  assert.equal(f.calls.at(-1).options.headers.cookie, current)
+  // Explicitly connecting an older runtime still stores the actual legacy pair.
+  assert.deepEqual(await recreated.connect({ headers: { host: req().headers.host, cookie: legacy } }, { endpoint: target }), connected)
+  assert.equal((await recreated.get(id)).cookie, legacy)
+})
+
+test('HTTPS reconnect never retries a rejected preferred cookie or modifies an existing grant on failure', async t => {
+  const target = 'https://127.0.0.1:3081'
+  const legacy = nativeCookie(target, 'test-only-saved', true)
+  const current = nativeCookie(target, 'test-only-new')
+  for (const [label, failure, code] of [
+    ['unauthorized', () => response({}, 401), 'REMOTE_LOGIN_REQUIRED'],
+    ['transport', () => { throw new Error('test-only connection failure') }, 'REMOTE_TRANSPORT'],
+    ['identity changed', () => response({ ...defaultCatalog(), instanceId: 'other-instance' }), 'REMOTE_INSTANCE_CHANGED'],
+  ]) await t.test(label, async () => {
+    let fail = false
+    const f = fixture({ fetchImpl: async () => fail ? failure() : response(defaultCatalog()) })
+    const connected = await f.connections.connect({ headers: { host: req().headers.host, cookie: legacy } }, { endpoint: target })
+    const before = structuredClone([...f.records])
+    fail = true
+    await rejectsCode(f.connections.connect({ headers: { host: req().headers.host, cookie: `${legacy}; ${current}` } }, { endpoint: target }), code)
+    assert.equal(f.calls.length, 2)
+    assert.equal(f.calls.at(-1).options.headers.cookie, current)
+    assert.deepEqual([...f.records], before)
+    assert.equal((await f.connections.get(connected.id)).cookie, legacy)
+  })
+})
+
+test('stored grants accept only their own protocol-specific names and v1 browser values', async t => {
+  const secure = 'https://127.0.0.1:3081'
+  for (const [label, target, changes] of [
+    ['HTTPS other port current name', secure, { cookieName: cookieName('https://127.0.0.1:3082') }],
+    ['HTTPS other port legacy name', secure, { cookieName: cookieName('https://127.0.0.1:3082', true) }],
+    ['HTTPS other hostname', secure, { cookieName: cookieName('https://localhost:3081') }],
+    ['HTTP cannot use HTTPS name', endpoint, { cookieName: cookieName(secure) }],
+    ['HTTP cannot use origin hash', endpoint, { cookieName: nameForAudience(new URL(endpoint).origin) }],
+    ['unrelated cookie', secure, { cookieName: 'operator-auth' }],
+    ['operator value', secure, { cookieValue: 'v2.operator.signature' }],
+    ['malformed browser value', secure, { cookieValue: 'v1.payload.signature=extra' }],
+    ['renamed endpoint', secure, { endpoint: 'https://127.0.0.1:3082/' }],
+  ]) await t.test(label, async () => {
+    const f = fixture()
+    const connected = await f.connections.connect({ headers: { host: req().headers.host, cookie: nativeCookie(target) } }, { endpoint: target })
+    const [key, record] = [...f.records][0]
+    Object.assign(record.payload, changes)
+    f.records.set(key, record)
+    await rejectsCode(f.connections.get(connected.id), 'REMOTE_CONNECTION_INVALID')
+    await rejectsCode(f.connections.list(), 'REMOTE_CONNECTION_INVALID')
+    await rejectsCode(f.connections.request(connected.id, '/agents'), 'REMOTE_CONNECTION_INVALID')
+    assert.equal(f.calls.length, 1)
+    assert.deepEqual(f.records.get(key), record)
+  })
 })
 
 test('legacy records omit name until explicitly renamed, including after reconnect', async () => {

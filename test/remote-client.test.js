@@ -281,6 +281,9 @@ test('main exposes an immediate persistent single-turn switch without modifying 
   await button(h.panel(), '远程管理').props.onClick()
   toggle = nodes(h.modal()).find(node => node.type === 'input')
   assert.equal(toggle.props.checked, true)
+  await button(h.modal(), '刷新').props.onClick()
+  toggle = nodes(h.modal()).find(node => node.type === 'input')
+  assert.equal(toggle.props.checked, true)
   await toggle.props.onChange({ target: { checked: false } })
   assert.deepEqual(JSON.parse(h.requests.at(-1).options.body), { waitForResult: false })
   assert.match(text(h.modal()), /后台回报/)
@@ -288,20 +291,84 @@ test('main exposes an immediate persistent single-turn switch without modifying 
   h.cleanup()
 })
 
-test('single-turn switch rolls back on save failure and never appears in a remote settings page', async () => {
-  const h = await harness({ fetch: async (url, options) => options.method === 'PUT'
-    ? { ok: false, status: 400, json: async () => ({ error: 'private' }) }
-    : { ok: true, status: 200, json: async () => url.endsWith('/config') ? config : url.endsWith('/connections') ? { connections: [] } : { runs: [] } } })
-  await button(h.panel(), '远程管理').props.onClick()
-  await nodes(h.modal()).find(node => node.type === 'input').props.onChange({ target: { checked: true } })
-  assert.equal(nodes(h.modal()).find(node => node.type === 'input').props.checked, false)
-  assert.match(text(h.modal()), /HTTP 400/)
-  assert.doesNotMatch(text(h.modal()), /private/)
+test('single-turn switch shows loading/saving state, prevents duplicate saves and rolls back failures', async () => {
+  let finishRead, finishSave, saved = { ...config }
+  const h = await harness({ fetch: async (url, options) => {
+    if (options.method === 'PUT') return new Promise(resolve => { finishSave = resolve })
+    if (url.endsWith('/config')) return new Promise(resolve => { finishRead = resolve })
+    return { ok: true, status: 200, json: async () => url.endsWith('/connections') ? { connections: [] } : { runs: [] } }
+  } })
+  const opened = button(h.panel(), '远程管理').props.onClick()
+  let toggle = nodes(h.modal()).find(node => node.type === 'input')
+  assert.equal(toggle.props.disabled, true)
+  assert.match(text(h.modal()), /正在读取/)
+  finishRead({ ok: true, status: 200, json: async () => saved })
+  await opened
+  for (const mode of [true, false]) {
+    toggle = nodes(h.modal()).find(node => node.type === 'input')
+    assert.equal(toggle.props.checked, !mode)
+    const saving = toggle.props.onChange({ target: { checked: mode } })
+    assert.equal(nodes(h.modal()).find(node => node.type === 'input').props.checked, mode)
+    assert.equal(nodes(h.modal()).find(node => node.type === 'input').props.disabled, true)
+    assert.equal(button(h.modal(), '刷新').props.disabled, true)
+    assert.equal(button(h.modal(), '关闭').props.disabled, true)
+    assert.match(text(h.modal()), /回复方式保存中/)
+    const count = h.requests.length
+    await toggle.props.onChange({ target: { checked: !mode } })
+    assert.equal(h.requests.length, count, 'must not submit concurrent mode writes')
+    finishSave({ ok: false, status: 400, json: async () => ({ error: 'private' }) })
+    await saving
+    toggle = nodes(h.modal()).find(node => node.type === 'input')
+    assert.equal(toggle.props.checked, !mode, 'failure restores the confirmed setting')
+    assert.equal(toggle.props.disabled, false)
+    assert.equal(button(h.modal(), '刷新').props.disabled, false)
+    assert.equal(button(h.modal(), '关闭').props.disabled, false)
+    assert.match(text(h.modal()), /HTTP 400/)
+    assert.doesNotMatch(text(h.modal()), /private|回复方式保存中|单轮回复已开启/)
+    const retry = toggle.props.onChange({ target: { checked: mode } })
+    saved = { ...saved, waitForResult: mode }
+    finishSave({ ok: true, status: 200, json: async () => saved })
+    await retry
+    assert.equal(nodes(h.modal()).find(node => node.type === 'input').props.checked, mode)
+    assert.equal(nodes(h.modal()).some(node => node.props?.role === 'alert'), false)
+  }
   h.cleanup()
-  const child = await harness({ base: 'http://localhost:3081/', embedded: true })
+})
+
+test('main defaults a missing reply mode to false and rejects non-boolean settings', async () => {
+  for (const mode of [undefined, 'true']) {
+    const oldConfig = { ...config }
+    if (mode === undefined) delete oldConfig.waitForResult
+    else oldConfig.waitForResult = mode
+    const h = await harness({ fetch: async url => ({ ok: true, status: 200,
+      json: async () => url.endsWith('/config') ? oldConfig : url.endsWith('/connections') ? { connections: [] } : { runs: [] } }) })
+    await button(h.panel(), '远程管理').props.onClick()
+    const toggle = nodes(h.modal()).find(node => node.type === 'input')
+    assert.equal(toggle.props.checked, false)
+    assert.equal(toggle.props.disabled, mode !== undefined)
+    if (mode !== undefined) assert.match(text(h.modal()), /无效的回复模式/)
+    assert.ok(h.requests.every(request => request.options.method === 'GET'), 'reading legacy settings must not write them')
+    h.cleanup()
+  }
+})
+
+test('remote workspace iframe hides the reply switch and never overwrites a true setting', async () => {
+  const child = await harness({ base: 'http://localhost:3081/', embedded: true,
+    fetch: async (url, options) => {
+      assert.ok(url.endsWith('/config'))
+      const input = options.method === 'PUT' ? JSON.parse(options.body) : {}
+      assert.equal(Object.hasOwn(input, 'waitForResult'), false)
+      return { ok: true, status: 200, json: async () => ({ ...config, waitForResult: true, ...input }) }
+    } })
   child.message(child.parent, 'http://localhost:3080', OPEN)
   await tick()
   assert.doesNotMatch(text(child.modal()), /单轮回复/)
+  const inputs = nodes(child.modal()).filter(node => node.type === 'input')
+  assert.equal(inputs.length, 1, 'only workspace selection remains')
+  inputs[0].props.onChange({ target: { checked: true } })
+  await button(child.modal(), '保存工作区').props.onClick()
+  assert.deepEqual(JSON.parse(child.requests.at(-1).options.body), { enabled: true, workspaceIds: ['sr'] })
+  assert.equal(child.modal(), null)
   child.cleanup()
 })
 

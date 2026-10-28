@@ -1,7 +1,102 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { Readable } from 'node:stream'
+import { RemoteStore } from '../src/remote/store.js'
+import { createRemoteRoute, REMOTE_ROUTE } from '../src/remote/routes.js'
 
 let loadSequence = 0
+
+function remoteConfigFixture(global) {
+  const snapshot = { global: structuredClone(global), tables: { runs: { running: { runId: 'running', state: 'running' } }, masters: {} } }
+  let writes = 0
+  const unit = {
+    loadAll: async () => structuredClone(snapshot),
+    setGlobal: async config => { writes++; snapshot.global = structuredClone(config) },
+    close: async () => {},
+  }
+  const ctx = {
+    storage: { backend: { get: () => ({ kv: { open: async () => unit } }) } },
+    webServer: { port: 3080 },
+    connection: { requestRejection: () => undefined },
+    workspaceRegistry: { list: () => [{ id: 'project', path: '/project' }], get: id => id === 'project' },
+  }
+  return { ctx, snapshot, writes: () => writes }
+}
+
+test('reply mode preserves old true/false settings and defaults missing fields without migration', async () => {
+  for (const mode of [undefined, true, false]) {
+    const global = { instanceId: 'existing', enabled: true, workspaceIds: ['project'], ...(mode === undefined ? {} : { waitForResult: mode }) }
+    const f = remoteConfigFixture(global)
+    const store = await RemoteStore.open(f.ctx)
+    const expected = { ...global, waitForResult: mode === true }
+    assert.deepEqual(store.getConfig(), expected)
+    assert.deepEqual(f.snapshot.global, global, 'opening must not rewrite old records')
+    assert.equal(f.writes(), 0)
+    for (const waitForResult of [true, false, true]) {
+      assert.deepEqual(await store.setConfig({ waitForResult }), { ...expected, waitForResult })
+      assert.deepEqual(f.snapshot.global, { ...expected, waitForResult })
+    }
+    assert.deepEqual(await store.setConfig({ enabled: false, workspaceIds: [] }), { ...expected, enabled: false, workspaceIds: [], waitForResult: true })
+    assert.deepEqual(store.get('runs', 'running'), { runId: 'running', state: 'running' })
+    assert.deepEqual(f.snapshot.tables.runs.running, { runId: 'running', state: 'running' })
+    await store.close()
+    const reopened = await RemoteStore.open(f.ctx)
+    assert.equal(reopened.getConfig().waitForResult, true)
+    assert.equal(f.writes(), 4, 'reopening must not migrate the saved true setting')
+    await reopened.close()
+  }
+})
+
+test('new remote config persists the default disabled reply mode', async () => {
+  const f = remoteConfigFixture(undefined)
+  const store = await RemoteStore.open(f.ctx)
+  assert.equal(store.getConfig().waitForResult, false)
+  assert.equal(store.getConfig().enabled, false)
+  assert.deepEqual(store.getConfig().workspaceIds, [])
+  assert.deepEqual(f.snapshot.global, store.getConfig())
+  assert.equal(f.writes(), 1)
+  await store.close()
+})
+
+test('config PUT persists either boolean reply mode without changing permissions or existing tasks', async () => {
+  const f = remoteConfigFixture({ instanceId: 'existing', enabled: true, workspaceIds: ['project'], waitForResult: true })
+  const store = await RemoteStore.open(f.ctx)
+  // Any unexpected worker/controller side effect fails: configuration must not stop tasks.
+  const forbidden = new Proxy({}, { get() { throw new Error('config must not control existing tasks') } })
+  const route = createRemoteRoute({ ctx: f.ctx, store, worker: forbidden, controller: forbidden })
+  async function request(method, input) {
+    const req = Readable.from(input === undefined ? [] : [Buffer.from(JSON.stringify(input))])
+    Object.assign(req, { method, url: `${REMOTE_ROUTE}/config`, headers: { 'content-type': 'application/json' } })
+    let status, value
+    const res = { writeHead(code) { status = code }, end(data) { value = JSON.parse(data) } }
+    await route(req, res)
+    return { status, value }
+  }
+  for (const mode of [true, false]) {
+    const result = await request('PUT', { waitForResult: mode })
+    assert.equal(result.status, 200)
+    assert.equal(result.value.waitForResult, mode)
+    assert.equal((await request('GET')).value.waitForResult, mode)
+    assert.equal(f.snapshot.global.waitForResult, mode)
+    assert.equal(result.value.enabled, true)
+    assert.deepEqual(result.value.workspaceIds, ['project'])
+  }
+  const changed = await request('PUT', { enabled: false, workspaceIds: [], waitForResult: true })
+  assert.equal(changed.status, 200)
+  assert.equal(changed.value.enabled, false)
+  assert.deepEqual(changed.value.workspaceIds, [])
+  assert.equal(changed.value.waitForResult, true)
+  assert.equal((await request('GET')).value.waitForResult, true)
+  const workspaceOnly = await request('PUT', { enabled: true, workspaceIds: ['project'] })
+  assert.equal(workspaceOnly.value.waitForResult, true, 'workspace changes must preserve reply mode')
+  const beforeInvalid = store.getConfig()
+  for (const input of [{ waitForResult: 'true' }, { waitForResult: null }, { waitForResult: 0 }, {}, { enabled: true }, { workspaceIds: ['project'] }, { waitForResult: true, extra: 1 }]) {
+    assert.equal((await request('PUT', input)).status, 400)
+  }
+  assert.deepEqual(store.getConfig(), beforeInvalid)
+  assert.deepEqual(store.get('runs', 'running'), { runId: 'running', state: 'running' })
+  await store.close()
+})
 
 async function loadClientModule() {
   let definition

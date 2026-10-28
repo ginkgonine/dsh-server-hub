@@ -333,7 +333,7 @@ test('model status omits requests and output in every cached lifecycle state whi
   assert.equal(f.prompts.length, 0, 'cached status reads must not dispatch notifications or invoke a model')
 })
 
-test('single-turn config persists independently of workspace changes and migrates old snapshots', async t => {
+test('single-turn config persists independently of workspace permissions and defaults false for old snapshots', async t => {
   const f = await fixture(t)
   assert.equal((await f.request('/config')).value.waitForResult, false)
   assert.equal((await f.request('/config', { method: 'PUT', input: { waitForResult: true } })).status, 200)
@@ -354,27 +354,42 @@ test('single-turn config persists independently of workspace changes and migrate
   assert.deepEqual(legacy.getConfig().workspaceIds, ['system'])
 })
 
-test('single-turn switch overrides explicit background and returns remote output without queuing another parent turn', async t => {
-  const { main, worker, connection } = await connected(t)
-  await main.request('/config', { method: 'PUT', input: { waitForResult: true } })
-  const started = once(worker.notices, 'worker-prompt')
-  let settled = false
-  const result = main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: 'Check', prompt: 'inspect', run_in_background: true },
-    { agent: { id: 'parent-1' }, callId: 'wait-1', signal: new AbortController().signal }).then(value => { settled = true; return value })
-  await bounded(started)
-  assert.equal(settled, false, 'current tool call must remain waiting')
-  assert.equal(main.prompts.length, 0)
-  await main.request('/config', { method: 'PUT', input: { waitForResult: false } })
-  worker.finish(worker.creates[0].sessionId, 'Training progress inspected')
-  const answer = await bounded(result)
-  assert.equal(answer.stopReason, 'completed')
-  assert.match(answer.output[0].text, /Training progress inspected/)
-  assert.equal(main.prompts.length, 0, 'no sessionController.prompt means no extra report turn')
-  assert.equal(worker.prompts.length, 1, 'no model polling during waiting')
-  assert.equal(main.runtime.store.get('masters', answer.runId).background, false)
+test('single-turn mode waits and returns output in this call on old DSH, taking precedence over explicit background', async t => {
+  for (const run_in_background of [false, true]) {
+    const { main, worker, connection } = await connected(t)
+    await main.request('/config', { method: 'PUT', input: { waitForResult: true } })
+    const started = once(worker.notices, 'worker-prompt')
+    let settled = false
+    const pending = main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: 'Check', prompt: 'inspect', run_in_background },
+      { agent: main.parent, callId: 'foreground-1', signal: new AbortController().signal }).then(value => { settled = true; return value })
+    await bounded(started)
+    assert.equal(settled, false)
+    assert.equal(main.prompts.length, 0)
+    await main.request('/config', { method: 'PUT', input: { waitForResult: false } })
+    worker.finish(worker.creates[0].sessionId, 'Training progress inspected')
+    const answer = await bounded(pending)
+    assert.equal(answer.stopReason, 'completed')
+    assert.match(answer.output[0].text, /Training progress inspected/)
+    assert.equal(main.prompts.length, 0, 'foreground completion must not wake a second result turn')
+    assert.equal(worker.prompts.length, 1)
+    assert.equal(main.runtime.store.get('masters', answer.runId).background, false)
+  }
 })
 
-test('delivery mode of an existing background task does not change when the single-turn setting changes', async t => {
+test('explicit foreground works with the switch off while default dispatch stays asynchronous', async t => {
+  const { main, worker, connection } = await connected(t)
+  assert.equal((await main.request('/config')).value.waitForResult, false)
+  const started = once(worker.notices, 'worker-prompt')
+  const pending = main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: 'Check', prompt: 'inspect', run_in_background: false },
+    { agent: main.parent, callId: 'explicit-wait', signal: new AbortController().signal })
+  await bounded(started)
+  worker.finish(worker.creates[0].sessionId, 'Explicit foreground result')
+  const answer = await bounded(pending)
+  assert.match(answer.output[0].text, /Explicit foreground result/)
+  assert.equal(main.prompts.length, 0)
+})
+
+test('changing the single-turn switch never re-dispatches an active background task or duplicates its report', async t => {
   const { main, worker, connection } = await connected(t)
   const args = { targetId: connection.targetId, workspaceId: 'system', description: 'Check', prompt: 'inspect', idempotencyKey: 'same-mode' }
   const exec = { agent: { id: 'parent-1' }, callId: 'bg-1', signal: new AbortController().signal }
@@ -649,34 +664,36 @@ test('busy-parent fixture keeps queued approvals in original notifications; stat
   assert.equal(worker.prompts.length, 1, 'same original remote model turn')
 })
 
-test('foreground questions and approvals return control to the Agent instead of waiting on a GUI or deadlocking', async t => {
+test('foreground questions and approvals hand back the original request then keep the same task in the background', async t => {
   for (const kind of ['questions', 'approval']) {
     const { main, worker, connection } = await connected(t)
     await main.request('/config', { method: 'PUT', input: { waitForResult: true } })
     main.ctx.userQuestions.ask = () => assert.fail('The controller Agent chooses how to ask the user')
     main.ctx.approval.request = () => assert.fail('No native escalation forwarding')
-    const started = once(worker.notices, 'worker-prompt')
-    const ac = new AbortController()
-    const result = main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: '交互巡检', prompt: 'inspect', run_in_background: true },
+    const started = once(worker.notices, 'worker-prompt'), ac = new AbortController()
+    const waiting = main.tools.get('remote_agent').execute({ targetId: connection.targetId, workspaceId: 'system', description: '交互巡检', prompt: 'inspect', run_in_background: true },
       { agent: main.parent, callId: `foreground-${kind}`, signal: ac.signal })
     await bounded(started)
     const agent = worker.agents.get(worker.creates[0].sessionId)
     const original = worker.hooks.get(kind === 'questions' ? 'user-questions/request' : 'approval/request')({ agent, signal: new AbortController().signal,
       ...(kind === 'questions' ? questionPayload() : { toolName: 'write', reason: 'Write config' }) }, () => assert.fail('must capture'))
-    const pending = await bounded(result)
-    assert.equal(pending.requests[0].kind, kind)
+    original.catch(() => {})
+    const pending = await bounded(waiting), request = pending.requests[0]
+    assert.equal(request.kind, kind)
     assert.match(pending.message, /当前聊天/)
-    assert.equal(main.prompts.length, 0, 'the waiting tool returns the request, without also queueing another notification')
-    assert.equal((await worker.runtime.worker.get(pending.runId)).state, kind === 'questions' ? 'waiting_input' : 'waiting_approval')
-    ac.abort() // Completion of the old tool call must not cancel the yielded task.
+    assert.equal(main.prompts.length, 0, 'the same question is not also queued after returning it in this tool call')
+    const record = await main.runtime.store.get('masters', pending.runId)
+    assert.equal(record.background, true)
+    assert.deepEqual(record.foregroundYield.requestIds, [request.id])
+    ac.abort() // Finishing the yielded foreground call must preserve the task.
     const reply = kind === 'questions' ? questionAnswer() : { outcome: 'allowed-once' }
-    await main.tools.get('remote_agent_respond').execute({ runId: pending.runId, requestId: pending.requests[0].id, ...reply },
+    await main.tools.get('remote_agent_respond').execute({ runId: pending.runId, requestId: request.id, ...reply },
       { agent: main.parent, callId: 'reply', signal: new AbortController().signal })
     assert.deepEqual(await bounded(original), kind === 'questions' ? questionAnswer() : 'allowed-once')
     const final = once(main.notices, 'report')
     worker.finish(agent.id)
     await bounded(final)
-    assert.equal(main.prompts.length, 1, 'only the eventual completion is reported in a new parent turn')
+    assert.equal(main.prompts.length, 1, 'only the final result needs a background report')
     assert.equal(worker.prompts.length, 1)
   }
 })

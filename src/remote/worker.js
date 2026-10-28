@@ -324,6 +324,18 @@ export class RemoteWorker {
     // Do not expose raw filesystem, tool inputs or protocol objects as diagnostics.
     const diagnostic = error?.code === 'REMOTE_STORAGE' ? error.message : 'Worker session could not complete its remote task'
     try { entry.agent?.cancel({ kind: 'user' }) } catch {}
+    if (entry.agent && !this.stopping.has(entry.runId)) {
+      // Publish the stop barrier before the error snapshot. Cancellation is only
+      // an acknowledgement; /drain must still wait for the Agent to reach idle.
+      const stopping = Promise.resolve().then(() => entry.agent.whenIdle()).then(async () => {
+        // An already-idle Agent must not archive before the terminal journal.
+        // This wait is outside serial(), so failure publication stays immediate.
+        await entry.done.promise.catch(() => {})
+        await this._archive(entry)
+      }).finally(() => { if (this.stopping.get(entry.runId) === stopping) this.stopping.delete(entry.runId) })
+      stopping.catch(() => {})
+      this.stopping.set(entry.runId, stopping)
+    }
     try {
       await this._finish(entry, { state: 'error', stopReason: 'error', output: [], diagnostic })
     } catch {
@@ -333,7 +345,6 @@ export class RemoteWorker {
       entry.admitted.reject(failure)
       entry.done.reject(failure)
     }
-    if (entry.agent) void entry.agent.whenIdle().then(() => this._archive(entry)).catch(() => {})
   }
 
   async _finish(entry, result) {
