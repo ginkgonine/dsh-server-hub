@@ -35,7 +35,8 @@ function fixture(t, overrides = {}) {
     put: async (_table, id, value) => serial(() => { records.set(id, structuredClone(value)); return value }),
     mutate: async (_table, id, callback) => serial(async () => { const next = await callback(structuredClone(records.get(id))); if (next) records.set(id, structuredClone(next)); return next }) }
   const parentSession = { id: 'parent' }
-  const ctx = { sessionController: { inspect: async () => ({ meta: { id: 'parent' }, events: structuredClone(parentEvents) }), prompt: async input => { reports.push(input) } },
+  const ctx = { sessionQuery: { readSession: async () => ({ session: { id: 'parent' }, events: structuredClone(parentEvents), inheritedEventCount: 0 }) },
+    sessionController: { prompt: async input => { reports.push(input) } },
     sessions: { get: () => parentSession, flush: async session => { flushes.push(session); return true } }, workspaceRegistry: { archivedSessionIds: [] } }
   const connections = { request: async (_target, path, options) => { requests.push({ path, options }); return { run: { runId: options.input.runId, state: 'completed', stopReason: 'completed', output: [{ type: 'text', text: 'Finished' }] } } },
     get: async () => ({ endpoint: 'http://127.0.0.1:3081/', instanceId: 'worker', cookie: 'private-cookie' }), ...overrides }
@@ -44,6 +45,24 @@ function fixture(t, overrides = {}) {
   const input = { runId: 'remote-run-1', targetId: 'target-1', workspaceId: 'workspace-1', prompt: 'inspect', description: 'Check', background: true }
   return { controller, ctx, store, records, input, reports, requests, automaticInteractions, parentEvents, parentSession, flushes }
 }
+
+test('parent reads use SessionQuery and treat only a missing session as absent', async t => {
+  const f = fixture(t)
+  const snapshot = await f.controller.readParent('parent')
+  assert.equal(snapshot.session.id, 'parent')
+  assert.deepEqual(snapshot.events, [])
+  f.ctx.sessionQuery.readSession = async () => { throw Object.assign(new Error('not found'), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' }) }
+  assert.equal(await f.controller.readParent('parent'), undefined)
+  for (const code of ['SESSION_QUERY_INVALID_LOG', 'EIO']) {
+    const failure = Object.assign(new Error('unreadable'), { code })
+    f.ctx.sessionQuery.readSession = async () => { throw failure }
+    await assert.rejects(f.controller.readParent('parent'), error => error === failure)
+    const record = seed(f, { state: 'completed', requests: [] })
+    await assert.rejects(f.controller.report(record), error => error === failure)
+    assert.equal(f.records.get(record.runId).reportDelivered, undefined)
+  }
+  assert.deepEqual(f.reports, [])
+})
 
 test('even instant completion reports once; native run has no local shadow Agent', async t => {
   const f = fixture(t)
@@ -168,7 +187,7 @@ test('cold native recovery detects durable notices without restoring ownership o
       const f = fixture(t), record = seed(f, { resultDelivery: 'native', nativeResultReady: true, state: 'completed', requests: [], output: [{ type: 'text', text: 'Done' }] })
       f.controller.nativeOwners.add(record.runId)
       f.parentEvents.push(nativeNotice(record.runId, type))
-      // Cold inspect can read durable events even when the session is not resident.
+      // SessionQuery can read durable events even when the session is not resident.
       f.ctx.sessions.get = () => undefined
       const restored = new RemoteController(f.ctx, f.store, f.controller.connections)
       t.after(() => restored.close())

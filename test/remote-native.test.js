@@ -9,10 +9,9 @@ import { RemoteController } from '../src/remote/controller.js'
 import { cookieForEndpoint } from '../src/remote/auth.js'
 
 // Opt in with DSH_TEST_RUNTIME=/path/to/node_modules/@deepseek-ai.
-// Set DSH_TEST_LEGACY_RUNTIME to an older runtime's @deepseek-ai directory for start() compatibility.
+// This suite targets DSH 0.2.2-rc.3; beta.2 retains the older runtime baseline.
 // No dependency on, or access to, an online DSH instance or its credentials.
 const runtime = process.env.DSH_TEST_RUNTIME
-const legacyRuntime = process.env.DSH_TEST_LEGACY_RUNTIME
 const nativeTest = (name, run) => test(name, { skip: !runtime }, run)
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 const tick = () => new Promise(resolve => setImmediate(resolve))
@@ -30,14 +29,14 @@ const load = (name, base = runtime) => import(pathToFileURL(resolve(base, name, 
  * Session), private persistence checkpoints, Hub's store and remote transport.
  * Neither startActivation nor the native manager implementation is replaced.
  */
-async function fixture(t, { parentStatus = 'running', failNotice = false, holdDrain = false, holdYieldCommit = false, runtimeBase = runtime, managed = true } = {}) {
-  const [{ Context }, { SubagentRuntime }, { Session }] = await Promise.all([
-    load('cordis', runtimeBase), load('dsh-subagent', runtimeBase), load('dsh-session', runtimeBase),
+async function fixture(t, { parentStatus = 'running', failNotice = false, holdDrain = false, holdYieldCommit = false } = {}) {
+  const [{ Context }, { SubagentRuntime }, { Session }, { SessionProjectionRegistry }] = await Promise.all([
+    load('cordis'), load('dsh-subagent'), load('dsh-session'), load('dsh-session-projection'),
   ])
   const ctx = new Context()
   const session = Session.create('native-test-parent')
   const nativeNotices = [], noticeAttempts = [], reports = [], flushes = [], lifecycle = [], calls = [], providerRuns = []
-  const parent = { id: session.id, session, options: {}, status: parentStatus }
+  const parent = { id: session.id, session, ctx, options: {}, status: parentStatus }
   const admit = (message, target) => {
     noticeAttempts.push(message)
     if (failNotice) throw new Error('test-only native parent admission failure')
@@ -53,15 +52,22 @@ async function fixture(t, { parentStatus = 'running', failNotice = false, holdDr
     flush: async value => { assert.equal(value, session); flushes.push(session.seq); return true } })
   ctx.provide('workspaceRegistry', { archivedSessionIds: [] })
   ctx.provide('sessionController', {
-    inspect: async id => { assert.equal(id, parent.id); return { events: session.ownEvents() } },
     prompt: async input => { reports.push(input) },
   })
+  ctx.provide('sessionQuery', {
+    readSession: async id => {
+      assert.equal(id, parent.id)
+      return { session: session.header, events: session.snapshotEvents(), inheritedEventCount: session.inheritedEventCount }
+    },
+  })
   for (const edge of ['start', 'end']) ctx.on(`subagent/${edge}`, info => { lifecycle.push({ edge, ...info }) })
+  const projectionFiber = ctx.plugin(SessionProjectionRegistry)
+  await bounded(projectionFiber.await())
+  assert.equal(projectionFiber.state, 2, 'real SessionProjectionRegistry must be ACTIVE')
   const nativeFiber = ctx.plugin(SubagentRuntime)
   await bounded(nativeFiber.await())
   assert.equal(nativeFiber.state, 2, 'real SubagentRuntime must be ACTIVE')
-  assert.equal(typeof ctx.subagents.startActivation, managed ? 'function' : 'undefined', 'test the selected runtime API without replacing it')
-  if (!managed) assert.equal(typeof ctx.subagents.start, 'function', 'legacy integration requires the real holder-owned start API')
+  assert.equal(typeof ctx.subagents.startActivation, 'function', 'exercise the current activation API without replacing it')
 
   const input = { runId: 'remote-native-test-run', targetId: 'test-target', workspaceId: 'test-workspace',
     description: 'Native lifecycle integration', prompt: 'Return the test-only remote result' }
@@ -167,10 +173,10 @@ async function fixture(t, { parentStatus = 'running', failNotice = false, holdDr
 nativeTest('actual native boot compatibility accepts supported DSH releases but rejects old and future prereleases', async () => {
   const { evaluatePluginCompatibility } = await load('dsh-app-boot')
   const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
-  for (const version of ['0.2.0-rc.1', '0.2.0-rc.2', '0.2.1-alpha.3', '0.2.1-rc.2', '0.2.1']) {
+  for (const version of ['0.2.2-rc.3']) {
     assert.equal(evaluatePluginCompatibility(manifest, {}, version), undefined, `supported runtime ${version}`)
   }
-  for (const version of ['0.1.7', '0.3.0-rc.1']) {
+  for (const version of ['0.1.7', '0.2.0-rc.1', '0.2.1-alpha.3', '0.2.1-rc.2', '0.2.1', '0.2.2-rc.2', '0.3.0-rc.1']) {
     const issue = evaluatePluginCompatibility(manifest, {}, version)
     assert.ok(issue, `unsupported runtime ${version}`)
     assert.equal(issue.runtimeVersion, version)
@@ -221,14 +227,21 @@ nativeTest('actual native manager owns one remote result notice and automaticall
     assert.ok(f.flushes.length > 0, 'native evidence must be checkpointed before marking delivery')
     assert.deepEqual(f.lifecycle.map(value => value.edge), ['start', 'end'])
     assert.equal(f.controller.nativeOwners.size, 0)
-    const catalog = f.parent.session.ownEvents().filter(event => event.type === 'subagent/catalog')
+    const events = f.parent.session.snapshotEvents()
+    const catalog = events.filter(event => event.type === 'subagent/catalog')
     assert.equal(catalog.length, 1)
+    assert.equal(catalog[0].data.version, 3)
+    assert.equal(catalog[0].data.name, 'agent-1')
     assert.equal(catalog[0].data.mode, 'external')
     assert.equal(catalog[0].data.childId, f.input.runId)
-    const inbox = f.parent.session.ownEvents().find(event => event.type === 'agent/inbox/spliced')
+    const projectedCatalog = f.ctx.sessionProjections.snapshot(f.parent.session, ['subagentCatalog']).values.subagentCatalog
+    assert.equal(projectedCatalog.length, 1, 'the real registry must fold the committed named child')
+    assert.equal(projectedCatalog[0].id, f.input.runId)
+    assert.equal(projectedCatalog[0].name, 'agent-1')
+    const inbox = events.find(event => event.type === 'agent/inbox/spliced')
     assert.equal(inbox.data.target, parentStatus === 'idle' ? 'next-turn' : 'next-step')
     await f.controller.report(delivered)
-    await f.ctx.subagents.drainChildren(f.parent, [f.input.runId])
+    await f.ctx.subagents.drainDescendants([f.parent])
     assert.equal(f.disposals, 1)
     assert.equal(f.nativeNotices.length, 1)
     assert.equal(f.reports.length, 0)
@@ -257,7 +270,7 @@ nativeTest('actual manager manual disposal interrupts once work is live and wait
   await bounded(f.dispatch.start(f.input, f.parent))
   await bounded(f.streamStarted.promise)
   let settled = false
-  const disposing = f.ctx.subagents.drainChildren(f.parent, [f.input.runId]).then(() => { settled = true })
+  const disposing = f.ctx.subagents.drainDescendants([f.parent]).then(() => { settled = true })
   await bounded(f.draining.promise)
   await tick()
   assert.equal(settled, false, 'native disposal must await remote quiescence, not just interruption acknowledgement')
@@ -272,7 +285,7 @@ nativeTest('actual manager manual disposal interrupts once work is live and wait
   assert.equal(f.nativeNotices.length, 1)
   assert.equal(f.reports.length, 0)
   assert.equal(f.calls.filter(call => call.path.endsWith('/drain')).length, 1)
-  await bounded(f.ctx.subagents.drainChildren(f.parent, [f.input.runId]))
+  await bounded(f.ctx.subagents.drainDescendants([f.parent]))
   assert.equal(f.disposals, 1)
 })
 
@@ -330,45 +343,6 @@ nativeTest('duplicate dispatch calls never create another native activation or r
   assert.deepEqual(f.lifecycle.map(value => value.edge), ['start', 'end'])
 })
 
-test('actual legacy SubagentRuntime.start returns running work and delivers exactly one Hub report', { skip: !legacyRuntime }, async t => {
-  const f = await fixture(t, { runtimeBase: legacyRuntime, managed: false }), tool = new AbortController()
-  const started = await bounded(Promise.all([
-    f.dispatch.start(f.input, f.parent, tool.signal), f.dispatch.start(f.input, f.parent),
-  ]))
-  assert.ok(started.every(value => value.state === 'running'), 'legacy dispatch returns while the remote task is still running')
-  assert.equal(started.filter(value => value.reused).length, 1)
-  assert.equal(f.records.get(f.input.runId).resultDelivery, 'hub')
-  assert.equal(f.controller.nativeOwners.size, 0)
-  assert.equal(f.providerStarts, 1)
-  assert.equal(f.disposals, 0)
-  assert.equal(f.reports.length, 0)
-  await bounded(f.streamStarted.promise)
-  tool.abort(new Error('test-only legacy parent tool completed'))
-  await tick()
-  assert.equal(f.calls[0].options.signal.aborted, false, 'published legacy work also outlives its parent tool signal')
-  assert.deepEqual(f.calls.map(call => call.path), ['/runs'])
-  f.finish()
-  const delivered = await f.waitForRecord(record => record.reportDelivered)
-  await bounded(f.providerRuns[0].result)
-  await tick() // The legacy dispatcher releases the holder-owned run after result settlement.
-  assert.equal(delivered.state, 'completed')
-  assert.equal(delivered.reportSource, 'hub')
-  assert.equal(f.reports.length, 1)
-  assert.equal(f.reports[0].sessionId, f.parent.id)
-  assert.equal(f.reports[0].requestId, `hub-result-${f.input.runId}`)
-  assert.match(JSON.stringify(f.reports[0].content), /Test-only worker finished/)
-  assert.equal(f.noticeAttempts.length, 0, 'old runtime has no automatic external activation notice')
-  assert.equal(f.nativeNotices.length, 0)
-  assert.equal(f.disposals, 1, 'legacy dispatcher releases the real holder-owned run once')
-  assert.deepEqual(f.lifecycle.map(value => value.edge), ['start', 'end'])
-  assert.equal((await f.dispatch.start(f.input, f.parent)).reused, true)
-  await f.controller.report(delivered)
-  assert.equal(f.providerStarts, 1)
-  assert.equal(f.disposals, 1)
-  assert.equal(f.reports.length, 1)
-  assert.deepEqual(f.calls.map(call => call.path), ['/runs'])
-})
-
 const foregroundQuestion = () => ({ id: 'request-question', kind: 'questions', createdAt: 1,
   questions: [{ id: 'choice', question: 'Choose', options: [{ label: 'A' }, { label: 'B' }] }] })
 const foregroundApproval = () => ({ id: 'request-approval', kind: 'approval', createdAt: 2,
@@ -385,14 +359,14 @@ const assertNoWaitListeners = controller => {
   assert.equal(controller.events.listenerCount('closed'), 0)
 }
 
-for (const [version, runtimeBase, managed] of [['native caller', runtime, true], ['legacy holder', legacyRuntime, false]]) {
-  test(`actual ${version} foreground completion returns once after teardown without parent notifications`, { skip: !runtimeBase }, async t => {
+{
+  test(`actual native caller foreground completion returns once after teardown without parent notifications`, { skip: !runtime }, async t => {
     for (const beforeWait of [false, true]) await t.test(beforeWait ? 'completion before wait' : 'completion during wait', async t => {
-      const f = await fixture(t, { runtimeBase, managed }), tool = new AbortController()
+      const f = await fixture(t), tool = new AbortController()
       const started = await bounded(f.dispatch.start({ ...f.input, background: false }, f.parent, tool.signal))
       assert.equal(started.background, false)
       assert.ok(started.execution)
-      assert.equal(f.records.get(f.input.runId).resultDelivery, managed ? 'caller' : 'hub')
+      assert.equal(f.records.get(f.input.runId).resultDelivery, 'caller')
       await bounded(f.streamStarted.promise)
       if (beforeWait) f.finish()
       const waiting = f.dispatch.waitForResult(started, f.parent, tool.signal, 'parent-call')
@@ -414,15 +388,15 @@ for (const [version, runtimeBase, managed] of [['native caller', runtime, true],
     })
   })
 
-  test(`actual ${version} foreground error waits for worker drain`, { skip: !runtimeBase }, async t => {
-    const f = await fixture(t, { runtimeBase, managed, holdDrain: true })
+  test(`actual native caller foreground error waits for worker drain`, { skip: !runtime }, async t => {
+    const f = await fixture(t, { holdDrain: true })
     const started = await bounded(f.dispatch.start({ ...f.input, background: false }, f.parent))
     let settled = false
     const waiting = f.dispatch.waitForResult(started, f.parent).then(value => { settled = true; return value })
     f.finish('error')
     await bounded(f.draining.promise)
     await tick()
-    assert.equal(settled, false, 'terminal snapshots cannot bypass native or legacy cleanup')
+    assert.equal(settled, false, 'terminal snapshots cannot bypass native cleanup')
     assert.equal(f.reports.length, 0)
     assert.equal(f.nativeNotices.length, 0)
     f.drain.resolve()
@@ -433,9 +407,9 @@ for (const [version, runtimeBase, managed] of [['native caller', runtime, true],
     assertNoWaitListeners(f.controller)
   })
 
-  test(`actual ${version} foreground questions, approvals and plan reviews yield without redispatch`, { skip: !runtimeBase }, async t => {
+  test(`actual native caller foreground questions, approvals and plan reviews yield without redispatch`, { skip: !runtime }, async t => {
     for (const makeRequest of [foregroundQuestion, foregroundApproval, foregroundPlan]) await t.test(makeRequest.name, async t => {
-      const f = await fixture(t, { runtimeBase, managed }), tool = new AbortController(), request = makeRequest()
+      const f = await fixture(t), tool = new AbortController(), request = makeRequest()
       const started = await bounded(f.dispatch.start({ ...f.input, background: false }, f.parent, tool.signal))
       await bounded(f.streamStarted.promise)
       // Already-pending requests must be visible to a waiter registered later.
@@ -445,7 +419,7 @@ for (const [version, runtimeBase, managed] of [['native caller', runtime, true],
       assert.deepEqual(next.pending.requests, [request])
       const record = f.records.get(f.input.runId)
       assert.equal(record.background, true)
-      assert.equal(record.resultDelivery, managed ? 'caller' : 'hub')
+      assert.equal(record.resultDelivery, 'caller')
       assert.deepEqual(record.notifiedRequests, [request.id])
       assert.equal(f.reports.length, 0, 'the question was returned through the tool, not prompted twice')
       assert.equal(f.disposals, 0)
@@ -471,8 +445,8 @@ for (const [version, runtimeBase, managed] of [['native caller', runtime, true],
     })
   })
 
-  test(`actual ${version} reused foreground runs cannot lend wait or cancellation ownership`, { skip: !runtimeBase }, async t => {
-    const f = await fixture(t, { runtimeBase, managed }), duplicateTool = new AbortController()
+  test(`actual native caller reused foreground runs cannot lend wait or cancellation ownership`, { skip: !runtime }, async t => {
+    const f = await fixture(t), duplicateTool = new AbortController()
     const [started, reused] = await bounded(Promise.all([
       f.dispatch.start({ ...f.input, background: false }, f.parent),
       f.dispatch.start({ ...f.input, background: true }, f.parent, duplicateTool.signal),

@@ -22,7 +22,7 @@ function fixture(native = true) {
     return run
   }
   const subagents = native ? {
-    startActivation: async spec => { calls.push(spec); return accept(spec.request, true) },
+    startActivation: async spec => { assert.equal('request' in spec, false); calls.push(spec); return accept(spec, true) },
     start: () => assert.fail('new DSH must never enter the legacy start seam'),
   } : { start: async (name, request) => { calls.push({ name, request }); return accept(request, false) } }
   const dispatch = new RemoteDispatch({ subagents }, store, controller)
@@ -39,9 +39,9 @@ test('new DSH background execution owns parent delivery and teardown', async () 
   assert.equal(spec.provider, 'server-hub-remote')
   assert.equal(spec.delivery, 'parent')
   assert.equal(spec.label, f.input.description)
-  assert.equal(spec.request.parent, f.parent)
-  assert.equal('signal' in spec.request, false)
-  const input = JSON.parse(spec.request.prompt[0].text)
+  assert.equal(spec.parent, f.parent)
+  assert.equal('request' in spec, false)
+  const input = JSON.parse(spec.prompt[0].text)
   assert.equal(input.background, true)
   assert.equal(input.resultDelivery, 'native')
   signal.abort()
@@ -57,7 +57,7 @@ test('new DSH foreground execution selects caller delivery and exposes only the 
   const first = await f.dispatch.start(input, f.parent)
   assert.equal(first.background, false)
   assert.equal(f.calls[0].delivery, 'caller')
-  const request = JSON.parse(f.calls[0].request.prompt[0].text)
+  const request = JSON.parse(f.calls[0].prompt[0].text)
   assert.equal(request.background, false)
   assert.equal(request.resultDelivery, 'caller')
   assert.equal(first.execution.result, f.receipts[0].result)
@@ -196,7 +196,7 @@ test('pre-aborted and startup-aborted dispatches do not leave cancellation owner
 test('failed native admission releases ownership but a durable accepted task is never submitted again', async () => {
   const f = fixture()
   f.subagents.startActivation = async spec => {
-    const input = JSON.parse(spec.request.prompt[0].text)
+    const input = JSON.parse(spec.prompt[0].text)
     f.records.set(input.runId, { ...input, originSessionId: f.parent.id, state: 'interrupted' })
     f.calls.push(spec)
     throw new Error('Catalog admission failed after provider start')

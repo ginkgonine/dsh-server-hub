@@ -251,10 +251,19 @@ export class RemoteController {
     // request must not hand off a newer, empty snapshot or lose a later question.
     return { yielded, run: publicRun(record) }
   }
+  async readParent(sessionId) {
+    try { return await this.ctx.sessionQuery.readSession(sessionId) }
+    catch (error) {
+      // A removed parent is not a destination. Corrupt logs and persistence
+      // failures must remain errors so recovery cannot claim false delivery.
+      if (error?.code === 'SESSION_QUERY_SESSION_NOT_FOUND') return undefined
+      throw error
+    }
+  }
   async reconcileYield(record, { force = false } = {}) {
     const current = await this.store.get('masters', record.runId), marker = current?.foregroundYield
     if (!marker) return current || record
-    const observed = await this.ctx.sessionController.inspect(current.originSessionId)
+    const observed = await this.readParent(current.originSessionId)
     if (!observed) return current
     const events = observed.events || []
     const delivered = events.some(event => {
@@ -296,7 +305,7 @@ export class RemoteController {
   async notifyOnce(record, request) {
     const current = await this.store.get('masters', record.runId)
     if (this.closed || !current || !current.background || terminal(current.state) || current.notifiedRequests?.includes(request.id) || !current.requests?.some(item => item.id === request.id)) return
-    const observed = await this.ctx.sessionController.inspect(current.originSessionId)
+    const observed = await this.readParent(current.originSessionId)
     if (!observed || this.ctx.workspaceRegistry.archivedSessionIds.includes(current.originSessionId)) return
     const guidance = request.kind === 'approval'
       ? '请在当前聊天向用户说明远程操作与原因，按用户授权处理。可以正常回复询问，也可以使用 ask_user_question。决定后调用 remote_agent_respond，outcome 为 allowed-once（允许一次）、rejected（拒绝）或 cancelled（取消）。'
@@ -403,11 +412,11 @@ export class RemoteController {
     const current = await this.store.get('masters', record.runId)
     if (!current.background || current.reportDelivered || !terminal(current.state) || this.closed || this.nativeOwners.has(current.runId)) return
     // No new parent session, no route chosen by the remote result, one stable admission ID.
-    const observed = await this.ctx.sessionController.inspect(current.originSessionId)
+    const observed = await this.readParent(current.originSessionId)
     if (!observed || this.ctx.workspaceRegistry.archivedSessionIds.includes(current.originSessionId)) return
     if (current.resultDelivery === 'native' && current.nativeResultReady === true) {
       // Native notices are durably logged either as queued/steering inbox
-      // splices or as consumed user messages. Inspect also reads cold sessions,
+      // splices or as consumed user messages. SessionQuery also reads cold sessions,
       // covering a crash between native delivery and the Hub checkpoint.
       const notice = message => message?.source?.kind === 'subagent-settled' && message.source.senderSessionId === current.runId
       const delivered = (observed.events || []).some(event =>

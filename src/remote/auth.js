@@ -119,6 +119,26 @@ export class RemoteConnections {
     this.ctx = ctx
     this.fetchImpl = fetchImpl
     this.prefix = `${SCOPE}remote-${port}-`
+    // Derived public context only: never retain credentials or workspace paths.
+    this.contextSnapshot = Object.freeze([])
+    this.contextRevision = 0
+    this.listSequence = 0
+  }
+
+  contextEntry(connection) {
+    return Object.freeze({ targetId: connection.targetId, endpoint: connection.endpoint,
+      ...(Object.hasOwn(connection, 'name') ? { name: connection.name } : {}) })
+  }
+
+  updateContext(connection, removedId) {
+    this.contextRevision += 1
+    const id = removedId || connection.targetId
+    const entries = this.contextSnapshot.filter(entry => entry.targetId !== id)
+    if (connection) {
+      const previous = this.contextSnapshot.findIndex(entry => entry.targetId === id)
+      entries.splice(previous < 0 ? entries.length : previous, 0, this.contextEntry(connection))
+    }
+    this.contextSnapshot = Object.freeze(entries)
   }
 
   key(id) {
@@ -150,17 +170,27 @@ export class RemoteConnections {
   }
 
   async list() {
-    const entries = await this.ctx.credentials.listRecords()
-    const result = []
-    for (const entry of entries) {
-      if (entry.kind !== 'grant' || typeof entry.key !== 'string' || !entry.key.startsWith(this.prefix)) continue
-      const id = `remote-${entry.key.slice(this.prefix.length)}`
-      if (!ID.test(id)) continue
-      const record = await this.ctx.credentials.readRecord(this.key(id))
-      if (!record) continue
-      result.push(this.public(this.stored(record, id)))
+    const sequence = ++this.listSequence
+    const revision = this.contextRevision
+    const current = () => sequence === this.listSequence && revision === this.contextRevision
+    try {
+      const entries = await this.ctx.credentials.listRecords()
+      const result = []
+      for (const entry of entries) {
+        if (entry.kind !== 'grant' || typeof entry.key !== 'string' || !entry.key.startsWith(this.prefix)) continue
+        const id = `remote-${entry.key.slice(this.prefix.length)}`
+        if (!ID.test(id)) continue
+        const record = await this.ctx.credentials.readRecord(this.key(id))
+        if (!record) continue
+        result.push(this.public(this.stored(record, id)))
+      }
+      // An earlier read cannot undo a successful mutation or a newer refresh.
+      if (current()) this.contextSnapshot = Object.freeze(result.map(connection => this.contextEntry(connection)))
+      return result
+    } catch (error) {
+      if (current()) this.contextSnapshot = Object.freeze([])
+      throw error
     }
-    return result
   }
 
   async connect(req, input) {
@@ -193,7 +223,9 @@ export class RemoteConnections {
       if (businessError && error === businessError) throw error
       fail('REMOTE_STORAGE', '主控无法保存连接信息；请检查 DSH 私有凭据存储是否可写。')
     }
-    return this.public(payload)
+    const connection = this.public(payload)
+    this.updateContext(connection)
+    return connection
   }
 
   /** Rename an existing grant locally; never read browser cookies or contact its target. */
@@ -222,6 +254,7 @@ export class RemoteConnections {
       if (businessError && error === businessError) throw error
       fail('REMOTE_STORAGE', '主控无法保存连接信息；请检查 DSH 私有凭据存储是否可写。')
     }
+    this.updateContext(connection)
     return connection
   }
 
@@ -232,7 +265,11 @@ export class RemoteConnections {
     return { endpoint: value.endpoint, cookie: `${value.cookieName}=${value.cookieValue}`, instanceId: value.instanceId }
   }
 
-  async forget(id) { await this.ctx.credentials.deleteRecord(this.key(id)); return { targetId: id, id, disconnected: true } }
+  async forget(id) {
+    await this.ctx.credentials.deleteRecord(this.key(id))
+    this.updateContext(undefined, id)
+    return { targetId: id, id, disconnected: true }
+  }
 
   async request(id, path, options = {}) {
     const connection = await this.get(id)

@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/ginkgonine/dsh-server-hub/releases"><img src="https://img.shields.io/github/v/release/ginkgonine/dsh-server-hub?style=flat-square&label=version" alt="Version"></a>
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DSH-Plugin-purple.svg?style=flat-square" alt="DSH Plugin"></a>
-  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node-%5E22.19%20%7C%7C%20%3E%3D24-brightgreen.svg?style=flat-square" alt="Node Compatibility"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node-%3E%3D24.9-brightgreen.svg?style=flat-square" alt="Node Compatibility"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License"></a>
 </p>
 
@@ -107,23 +107,32 @@
 
 ### DSH 版本兼容
 
-**`v0.3.0-beta.2` 是面向 DSH `0.2.1-rc.2` 的旧版基线**，保留本轮发布前的执行接口与行为，不宣称兼容 DSH `0.2.2-rc.3`。固定此版本安装：
+插件按 DSH 版本分开发布，请固定 tag 安装，不要让旧 DSH 跟随仓库默认分支升级：
+
+| 插件 tag | DSH 适配目标 | 说明 |
+| --- | --- | --- |
+| [`v0.3.0-beta.2`](https://github.com/ginkgonine/dsh-server-hub/tree/v0.3.0-beta.2) | `0.2.1-rc.2` | 旧版基线，保留原执行接口与行为 |
+| [`v0.3.0-beta.3`](https://github.com/ginkgonine/dsh-server-hub/tree/v0.3.0-beta.3) | `0.2.2-rc.3` | 当前版本；Node.js ≥24.9，不支持旧 DSH |
 
 ```bash
+# 仍使用 DSH 0.2.1-rc.2
 dsh plugin --profile web add github:ginkgonine/dsh-server-hub#v0.3.0-beta.2
+# 已升级到 DSH 0.2.2-rc.3
+dsh plugin --profile web add github:ginkgonine/dsh-server-hub#v0.3.0-beta.3
 ```
 
-当前适配目标为官方已发布的 [DSH `0.2.1-rc.2`](https://www.npmjs.com/package/@deepseek-ai/dsh/v/0.2.1-rc.2)，不是尚未发布的 `0.2.1` stable。`engines.dsh` 从 `0.2.0-rc.1` 起覆盖到 `<0.3.0`，显式包含 `0.2.1` 预发布；connection/webserver peer 保留新旧接口版本范围。
+当前 `engines.dsh` 与 connection/webserver peer 限定为 `>=0.2.2-rc.3 <0.2.3-0`。已核对和原生测试的目标是 `0.2.2-rc.3`；不代表尚未验证的后续版本一定兼容。旧版不需要版本豁免，请使用对应 tag。
 
-* 新版 DSH 的原生 `startActivation` 前台使用 `delivery: 'caller'`，后台使用 `delivery: 'parent'`；activation 的 delivery 固定，前台遇审批／提问先将请求返回当前聊天，保存原任务并转后台，后续由 Hub 补最终报告，不会重新派单。旧 `0.2.0` 保留兼容。Hub 保留审批／问题转发，以及远端断线和重启后的原任务恢复，不增加原生自动放权。
-* 更新 DSH peer 范围，避免新版安装/启动兼容性校验拒绝加载（optional peer 也参与 DSH 校验），无需使用版本豁免。
+* 原生 `startActivation` 使用顶层 `parent` / `prompt` 参数，前台使用 `delivery: 'caller'`，后台使用 `delivery: 'parent'`；前台遇审批／提问先将请求返回当前聊天，再保留原任务转后台，最终由 Hub 补报，不重新派单。
+* 会话历史改用 `sessionQuery.readSession()`，支持冷会话回报去重与前台交接恢复；已删除的主控会话不会创建替代会话。
+* 通过原生动态 context 注册连接名称，按当前步骤准入工具决定显示；不再读取已移除的 `assembly.tools`，不将私有凭据放进模型上下文。
 * Host 使用 `agents.list()` / `agent.status` 和 `agent/status` 跟踪真实生命周期，不再依赖 Web API 投影事件或历史 turn 日志推断状态。
 * Web API 请求使用文档相对路径，支持将主控页面部署到带尾部 `/` 的反向代理子路径；代理仍需把该前缀剥离后转发到 DSH。
 * 最新版 `layout.selectPanel`、Slot 注册和 `__ModuleLoader__` 接口仍兼容，保留原有前端加载方式和 v1 状态协议。
 
 运行 `npm run check` 可验证构建、生命周期/等待状态回归、Slot 注册及根路径/代理子路径请求。接口核对与自动化回归不等同于真实浏览器端到端验收，也不表示在线实例已升级或启用。
 
-### 🤝 远程 Agent 快速连接（0.3.0-beta.1）
+### 🤝 远程 Agent 快速连接（0.3.0-beta.3）
 
 **选工作区 → 连接远程 → 在主控聊天中下达任务。**
 
@@ -151,7 +160,7 @@ dsh plugin --profile web add github:ginkgonine/dsh-server-hub#v0.3.0-beta.2
 在作为主控的 DSH 实例上安装，启用 Hub 面板与智能发现：
 
 ```bash
-dsh plugin --profile web add github:ginkgonine/dsh-server-hub
+dsh plugin --profile web add github:ginkgonine/dsh-server-hub#v0.3.0-beta.3
 dsh web
 ```
 
@@ -159,7 +168,7 @@ dsh web
 如果希望查看某个实例（本地或远程）的 Agent 状态，或向它派出远程 Agent，在该实例上也执行安装并重启对应的 DSH Web：
 
 ```bash
-dsh plugin --profile web add github:ginkgonine/dsh-server-hub
+dsh plugin --profile web add github:ginkgonine/dsh-server-hub#v0.3.0-beta.3
 # 停止旧进程后重新启动
 dsh web
 ```
@@ -216,7 +225,9 @@ dsh web
 dsh plugin --profile web update dsh-server-hub
 ```
 
-更新后停止旧进程并重新运行 `dsh web`。如果主控与远端暂时没有同时更新，已有的 v1 状态协议仍可继续通信，但建议最终保持版本一致。
+更新后停止旧进程并重新运行 `dsh web`。旧 DSH `0.2.1-rc.2` 请固定在 `v0.3.0-beta.2`；升级 DSH 后再显式安装 `v0.3.0-beta.3`，不要通过版本豁免加载不匹配的插件。已有 v1 状态协议未改变，但跨版本远程派单不在本轮验收范围内，建议主控与远端保持相同 DSH 和插件版本。
+
+DSH `0.2.2` 的原生 subagent 目录会写入新版载荷，旧 DSH 可能无法读取。回退插件 tag 不等于回退 DSH 会话格式；升级前备份数据，共享同一 Session 存储的进程应统一升级。
 
 ### 卸载插件
 
@@ -265,6 +276,14 @@ cd dsh-server-hub
 # 2. 构建与运行测试
 npm run build
 npm test
+npm run check
+
+# 可选：在当前 DSH npm 安装环境运行真实 Cordis / Projection / SubagentRuntime 集成测试
+# DSH_INSTALL_DIR 指向 DSH 0.2.2-rc.3 的安装目录；不访问在线实例或真实登录凭据
+DSH_TEST_RUNTIME="$DSH_INSTALL_DIR/node_modules/@deepseek-ai" \
+DSH_TEST_CORDIS="$DSH_INSTALL_DIR/node_modules/@deepseek-ai/cordis/lib/index.js" \
+DSH_TEST_CONNECTION="$DSH_INSTALL_DIR/node_modules/@deepseek-ai/dsh-client-connection/lib/index.js" \
+DSH_TEST_SYSTEM_PROMPT="$DSH_INSTALL_DIR/node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js" \
 npm run check
 
 # 3. 安装本地源码版本至 DSH

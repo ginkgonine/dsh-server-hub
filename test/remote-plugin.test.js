@@ -10,7 +10,7 @@ import { RemoteStore } from '../src/remote/store.js'
 test('Cordis injection metadata names services directly, not required/optional pseudo-services', () => {
   assert.ok(Array.isArray(inject))
   assert.deepEqual(inject, ['webServer', 'connection', 'storage', 'storage.backend.json', 'credentials',
-    'workspaceRegistry', 'sessionController', 'sessions', 'tools', 'subagents'])
+    'workspaceRegistry', 'sessionController', 'sessionQuery', 'sessions', 'tools', 'subagents', 'systemPrompt'])
 })
 
 test('published entry and bundle retain the same direct service dependencies', async () => {
@@ -63,7 +63,7 @@ function assertResponseAck(value, runId, requestId) {
 
 /** Fake DSH Agent/model services; real network, storage contracts and plugin code. */
 async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inject, apply }, nativeConnection) {
-  const tools = new Map(), providers = new Map(), hooks = new Map(), agents = new Map(), sessions = new Map(), credentials = new Map()
+  const tools = new Map(), providers = new Map(), hooks = new Map(), agents = new Map(), sessions = new Map(), credentials = new Map(), promptContexts = new Map()
   const effects = [], prompts = [], notices = new EventEmitter(), units = new Map(), creates = []
   let handler
   const server = http.createServer((req, res) => handler ? handler(req, res) : (res.writeHead(404), res.end()))
@@ -105,8 +105,18 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
       archivedSessionIds: [], archiveSession: async id => { ctx.workspaceRegistry.archivedSessionIds.push(id) } },
     sessions: { get: id => sessions.get(id), flush: async () => true },
     permissionPresets: { set() { assert.fail('Remote plugin must not reset permissions') } },
+    sessionQuery: { readSession: async id => {
+      if (!sessions.has(id)) throw Object.assign(new Error('Session not found'), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' })
+      const session = sessions.get(id)
+      return { session: session.header, events: session.ownEvents?.() || [] }
+    } },
+    systemPrompt: { context(definition) {
+      assert.ok(Number.isFinite(definition.order))
+      assert.equal(definition.interpolate, false)
+      promptContexts.set(definition.name, definition)
+      return () => promptContexts.delete(definition.name)
+    } },
     sessionController: {
-      inspect: async id => { if (!sessions.has(id)) throw new Error('Session not found'); return sessions.get(id) },
       create: async input => {
         creates.push(input)
         const events = [], idle = deferred(), scopedHooks = new Map(), guards = []
@@ -117,8 +127,7 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
         sessions.set(input.sessionId, session); agents.set(input.sessionId, agent)
         return { sessionId: input.sessionId }
       },
-      // Actual current API shape, not the old alpha's incorrect { agent } mock.
-      resolveAgent: async id => agents.get(id),
+      resolveAgent: async id => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'SESSION_NOT_FOUND' } },
       prompt: async input => {
         prompts.push(input)
         if (input.sessionId === 'parent-1') notices.emit('report', input)
@@ -130,19 +139,33 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
         return { accepted: true }
       },
     },
-    tools: { register(tool) { tools.set(tool.name, tool); return () => tools.delete(tool.name) } },
+    tools: { register(tool) { tools.set(tool.name, tool); return () => tools.delete(tool.name) },
+      get(name, scope, toolSet) { return toolSet === undefined ? tools.get(name) : toolSet.view(scope).get(name) } },
     subagents: { registerProvider(provider) { providers.set(provider.name, provider); return () => providers.delete(provider.name) },
       start: async (name, request) => providers.get(name).start(request) },
   }
   // Also run this fixture through the actual installed Cordis when requested:
   // DSH_TEST_CORDIS=<absolute Cordis module path> node --test test/remote-plugin.test.js
-  let runtime, assemblePrompt
+  let runtime, nativeSystemPrompt
+  const registeredAssembly = context => ({ sections: [], contexts: [...promptContexts.values()]
+    .sort((left, right) => left.order - right.order).map(definition => {
+      const text = definition.text(context)
+      assert.equal(typeof text, 'string', 'registered context providers must be synchronous')
+      return { name: definition.name, text, interpolate: definition.interpolate }
+    }), variables: {} })
   if (cordis) {
     const root = new cordis.Context()
     t.after(() => root.fiber.dispose())
+    const systemPrompt = process.env.DSH_TEST_SYSTEM_PROMPT ? await import(process.env.DSH_TEST_SYSTEM_PROMPT) : undefined
     for (const name of inject) {
-      if (name === 'connection' && nativeConnection) continue
+      if ((name === 'connection' && nativeConnection) || (name === 'systemPrompt' && systemPrompt)) continue
       root.provide(name, name === 'storage.backend.json' ? {} : ctx[name])
+    }
+    if (systemPrompt) {
+      const promptFiber = root.plugin(systemPrompt.default || systemPrompt.SystemPrompt)
+      await bounded(promptFiber.await())
+      assert.equal(promptFiber.state, 2, 'real SystemPrompt must become ACTIVE')
+      nativeSystemPrompt = root.systemPrompt
     }
     if (nativeConnection) {
       await bounded(root.plugin(nativeConnection).await())
@@ -157,13 +180,10 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
     await bounded(fiber.await())
     assert.equal(fiber.state, 2, 'plugin must become ACTIVE, not PENDING/FAILED')
     runtime = { ...root.serverHubRemote, dispose: () => fiber.dispose() }
-    assemblePrompt = (assembly, context) => root.waterfall('system-prompt/assemble', assembly, context, () => Promise.resolve(assembly))
   } else {
     const dispose = await apply(ctx)
     assert.equal(typeof dispose, 'function', 'async apply must resolve to a valid Cordis disposer')
     runtime = { ...ctx.serverHubRemote, dispose }
-    assemblePrompt = (assembly, context) => hooks.has('system-prompt/assemble')
-      ? hooks.get('system-prompt/assemble')(assembly, context, () => Promise.resolve(assembly)) : Promise.resolve(assembly)
   }
   t.after(async () => { await runtime.dispose(); for (const cleanup of effects.reverse()) await cleanup?.() })
   const request = async (path, { method = 'GET', input, cookies = cookie, origin } = {}) => {
@@ -177,9 +197,15 @@ async function fixture(t, cordis, plugin = { name: 'dsh-server-hub-remote', inje
       { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
     agent.status = 'idle'; agent.idle.resolve()
   }
-  const assemble = ({ visibleTools = [...tools.values()], agent = parent } = {}) => assemblePrompt(
-    { sections: [], contexts: [], tools: visibleTools, variables: {} }, { agent })
-  return { ctx, runtime, tools, providers, cookie, endpoint, request, finish, prompts, notices, creates, credentials, agents, units, parent, hooks, assemble }
+  const assemble = ({ visibleTools = [...tools.values()], agent = parent, scope = agent } = {}) => {
+    const admitted = new Map(visibleTools.map(tool => [tool.name, tool]))
+    const context = { agent, scope, toolSet: { view(requestedScope) {
+      assert.equal(requestedScope, agent || scope, 'context must query tools in the current scope')
+      return admitted
+    } } }
+    return nativeSystemPrompt ? nativeSystemPrompt.assemble(context) : registeredAssembly(context)
+  }
+  return { ctx, runtime, tools, providers, cookie, endpoint, request, finish, prompts, notices, creates, credentials, agents, units, parent, hooks, assemble, promptContexts, nativeSystemPrompt }
 }
 
 test('actual Cordis activates routes/tools and removes them on disposal', { skip: !process.env.DSH_TEST_CORDIS }, async t => {
@@ -452,7 +478,7 @@ test('model tool descriptions explain automatic delivery, ending the turn and on
 })
 
 const instanceContext = assembly => assembly.contexts.find(section => section.name === 'server-hub:remote-instances')
-const instanceText = assembly => instanceContext(assembly) ? assembly.variables.server_hub_remote_instances : ''
+const instanceText = assembly => instanceContext(assembly)?.text || ''
 
 test('instance context is absent without connections and follows connect, rename, disconnect and reconnect', async t => {
   const main = await fixture(t), worker = await fixture(t)
@@ -467,7 +493,8 @@ test('instance context is absent without connections and follows connect, rename
   let assembly = await main.assemble()
   assert.match(instanceText(assembly), expectedPrefix('197服务器'))
   assertBackgroundGuidance(instanceText(assembly))
-  assert.equal(instanceContext(assembly).text, '{{server_hub_remote_instances}}')
+  assert.equal(instanceContext(assembly).interpolate, false)
+  assert.equal(main.hooks.has('system-prompt/assemble'), false, 'text must use the context registry, not an assembly waterfall')
   assert.equal((await main.request(path, { method: 'PUT', input: { name: '训练服务器' } })).status, 200)
   assembly = await main.assemble()
   assert.match(instanceText(assembly), expectedPrefix('训练服务器'))
@@ -475,7 +502,7 @@ test('instance context is absent without connections and follows connect, rename
   assert.equal(assembly.contexts.length, 1)
   assert.equal((await main.request(path, { method: 'DELETE' })).status, 200)
   assembly = await main.assemble()
-  assert.deepEqual(assembly.contexts, [])
+  assert.equal(instanceText(assembly), '')
   assert.deepEqual(assembly.variables, {})
   assert.equal((await connect()).status, 200)
   const reconnected = instanceText(await main.assemble())
@@ -503,6 +530,71 @@ test('instance context lists all names, falls back to endpoint, and never probes
   assert.equal(text.split('\n').filter(line => line === '- 197服务器').length, 2, 'do not hide duplicate names')
 })
 
+test('connection context snapshot is minimal, frozen and read without storage or remote I/O', async t => {
+  const { main, connection } = await connected(t)
+  const snapshot = main.runtime.connections.contextSnapshot
+  assert.deepEqual(snapshot, [{ targetId: connection.targetId, endpoint: connection.endpoint }])
+  assert.ok(Object.isFrozen(snapshot))
+  assert.ok(Object.isFrozen(snapshot[0]))
+  assert.throws(() => snapshot.push({}), TypeError)
+  assert.throws(() => { snapshot[0].endpoint = 'http://localhost:1/' }, TypeError)
+  main.ctx.credentials.listRecords = async () => assert.fail('context evaluation must not read credentials')
+  main.ctx.credentials.readRecord = async () => assert.fail('context evaluation must not read credentials')
+  main.runtime.connections.fetchImpl = async () => assert.fail('context evaluation must not probe remote instances')
+  assert.ok(instanceText(await main.assemble()).includes(connection.endpoint))
+  assert.equal(main.prompts.length, 0)
+})
+
+test('a late connection list cannot overwrite a successful rename or forget', async t => {
+  for (const operation of ['rename', 'forget']) await t.test(operation, async t => {
+    const { main, connection } = await connected(t)
+    const manager = main.runtime.connections
+    const entered = deferred(), release = deferred()
+    const originalRead = main.ctx.credentials.readRecord
+    main.ctx.credentials.readRecord = async key => {
+      const captured = await originalRead(key)
+      entered.resolve()
+      await release.promise
+      return captured
+    }
+    const pending = manager.list()
+    await entered.promise
+    if (operation === 'rename') await manager.rename(connection.targetId, 'new name')
+    else await manager.forget(connection.targetId)
+    release.resolve()
+    await pending
+    if (operation === 'rename') assert.equal(manager.contextSnapshot[0].name, 'new name')
+    else assert.deepEqual(manager.contextSnapshot, [])
+  })
+})
+
+test('newer connection refresh wins over an older list and stale read failure', async t => {
+  for (const failure of [false, true]) await t.test(failure ? 'late failure' : 'late success', async t => {
+    const { main, connection } = await connected(t)
+    const manager = main.runtime.connections
+    const entered = deferred(), release = deferred()
+    const originalRead = main.ctx.credentials.readRecord
+    main.ctx.credentials.readRecord = async key => {
+      const captured = await originalRead(key)
+      entered.resolve()
+      await release.promise
+      if (failure) throw new Error('stale refresh failed')
+      return captured
+    }
+    const pending = manager.list()
+    const settled = pending.catch(error => error)
+    await entered.promise
+    main.ctx.credentials.readRecord = originalRead
+    const [key, previous] = [...main.credentials][0]
+    main.credentials.set(key, { ...previous, payload: { ...previous.payload, name: 'external update' } })
+    await manager.list()
+    release.resolve()
+    await settled
+    assert.equal(manager.contextSnapshot[0].targetId, connection.targetId)
+    assert.equal(manager.contextSnapshot[0].name, 'external update')
+  })
+})
+
 test('instance context is omitted when dispatch tools are unavailable, in child/worker agents or on storage failure', async t => {
   const { main } = await connected(t)
   for (const hidden of ['remote_agent', 'remote_agent_targets']) {
@@ -514,10 +606,11 @@ test('instance context is omitted when dispatch tools are unavailable, in child/
   try { assert.equal(instanceText(await main.assemble({ agent: workerAgent })), '') }
   finally { main.runtime.worker.live.delete('context-test') }
   main.ctx.credentials.listRecords = async () => { throw new Error('storage unavailable') }
+  await assert.rejects(main.runtime.connections.list(), /storage unavailable/)
   assert.equal(instanceText(await main.assemble()), '')
 })
 
-test('real Cordis assembly hook renders instance names literally and is removed on disposal', {
+test('real SystemPrompt registry assembles and refreshes literal instance context and disposes it', {
   skip: !process.env.DSH_TEST_CORDIS || !process.env.DSH_TEST_SYSTEM_PROMPT,
 }, async t => {
   const cordis = await import(process.env.DSH_TEST_CORDIS)
@@ -526,9 +619,16 @@ test('real Cordis assembly hook renders instance names literally and is removed 
   const name = '训练{{unknown_variable}}服务器'
   assert.equal((await main.request(`/connections/${connection.targetId}`, { method: 'PUT', input: { name } })).status, 200)
   const assembly = await main.assemble()
+  assert.ok(main.nativeSystemPrompt, 'exercise the actual registry and assemble(), not a hand-built waterfall')
   assert.ok(renderContextSnapshot(assembly).includes(`- ${name}`))
+  const renamed = '刷新{{still_literal}}服务器'
+  await main.request(`/connections/${connection.targetId}`, { method: 'PUT', input: { name: renamed } })
+  const refreshed = main.nativeSystemPrompt.refreshContext(assembly, { agent: main.parent, scope: main.parent,
+    toolSet: { view: () => main.tools } })
+  assert.ok(renderContextSnapshot(refreshed).includes(`- ${renamed}`), 'admission refresh recomputes the registered context')
   await main.runtime.dispose()
-  assert.equal(instanceText(await main.assemble()), '')
+  const disposed = await main.assemble()
+  assert.equal(instanceContext(disposed), undefined, 'plugin disposal removes the actual registry entry')
 })
 
 const questionPayload = () => ({ questions: [{ id: 'scope', question: '选择检查范围', options: [{ label: 'GPU进程' }, { label: '全部' }] }] })
