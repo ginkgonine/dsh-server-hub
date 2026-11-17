@@ -107,6 +107,12 @@
 
 ### DSH 版本兼容
 
+**`v0.3.0-beta.2` 是面向 DSH `0.2.1-rc.2` 的旧版基线**，保留本轮发布前的执行接口与行为，不宣称兼容 DSH `0.2.2-rc.3`。固定此版本安装：
+
+```bash
+dsh plugin --profile web add github:ginkgonine/dsh-server-hub#v0.3.0-beta.2
+```
+
 当前适配目标为官方已发布的 [DSH `0.2.1-rc.2`](https://www.npmjs.com/package/@deepseek-ai/dsh/v/0.2.1-rc.2)，不是尚未发布的 `0.2.1` stable。`engines.dsh` 从 `0.2.0-rc.1` 起覆盖到 `<0.3.0`，显式包含 `0.2.1` 预发布；connection/webserver peer 保留新旧接口版本范围。
 
 * 新版 DSH 的原生 `startActivation` 前台使用 `delivery: 'caller'`，后台使用 `delivery: 'parent'`；activation 的 delivery 固定，前台遇审批／提问先将请求返回当前聊天，保存原任务并转后台，后续由 Hub 补最终报告，不会重新派单。旧 `0.2.0` 保留兼容。Hub 保留审批／问题转发，以及远端断线和重启后的原任务恢复，不增加原生自动放权。
